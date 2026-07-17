@@ -159,6 +159,10 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Use `hooks.before_handoff` for deterministic gates that must pass before
+  `linear_issue_handoff` is durably queued. The command runs in the issue workspace with
+  `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, and `SYMPHONY_TARGET_STATE`; a non-zero exit
+  leaves the issue in its current state and returns the failure to the agent.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

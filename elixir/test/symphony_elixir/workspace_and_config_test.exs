@@ -666,11 +666,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         hook_after_create: "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
+        hook_before_handoff: "printf '%s|%s|%s' \"$SYMPHONY_ISSUE_ID\" \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_TARGET_STATE\" > before_handoff.log",
         hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
       )
 
       config = Config.settings!()
       assert config.hooks.after_create =~ "echo after_create > after_create.log"
+      assert config.hooks.before_handoff =~ "SYMPHONY_TARGET_STATE"
       assert config.hooks.before_remove =~ "echo before_remove >"
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS")
@@ -678,6 +680,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, _workspace} = Workspace.create_for_issue("MT-HOOKS")
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
+
+      assert :ok =
+               Workspace.run_before_handoff_hook(
+                 workspace,
+                 %{id: "issue-uuid", identifier: "MT-HOOKS"},
+                 "In Review"
+               )
+
+      assert File.read!(Path.join(workspace, "before_handoff.log")) ==
+               "issue-uuid|MT-HOOKS|In Review"
 
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS")
       assert File.read!(before_remove_marker) == "before_remove\n"

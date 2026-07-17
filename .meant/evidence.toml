@@ -1,0 +1,12 @@
+schema_version = "1.0"
+base_ref = "origin/main"
+output_dir = ".meant/evidence"
+timeout_seconds = 900
+require_remote_match = true
+require_pull_request = true
+require_checks = true
+
+[[commands]]
+name = "required"
+kind = "test"
+command = ["make", "-C", "elixir", "all"]
