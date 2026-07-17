@@ -21,7 +21,7 @@ defmodule SymphonyElixir.TerminalReconciler do
     workspace_registry = Keyword.get(opts, :workspace_registry, WorkspaceRegistry)
     tracker = Keyword.get(opts, :tracker, Tracker)
     archive_fun = Keyword.get(opts, :archive_fun, &AppServer.archive_thread/2)
-    workspace_cleanup_fun = Keyword.get(opts, :workspace_cleanup_fun, &WorkspaceRegistry.cleanup/1)
+    workspace_cleanup_fun = Keyword.get(opts, :workspace_cleanup_fun, &WorkspaceRegistry.cleanup_result/1)
     pending_fun = Keyword.get(opts, :pending_fun, &PendingHandoff.pending?/1)
     terminal_states = terminal_state_set(Keyword.get(opts, :terminal_states))
 
@@ -38,6 +38,7 @@ defmodule SymphonyElixir.TerminalReconciler do
           issue_id,
           Map.get(issues_by_id, issue_id),
           Enum.find(thread_entries, &(&1.issue_id == issue_id)),
+          Enum.any?(workspace_entries, &(&1.issue_id == issue_id)),
           state,
           %{
             terminal_states: terminal_states,
@@ -69,7 +70,7 @@ defmodule SymphonyElixir.TerminalReconciler do
     end)
   end
 
-  defp reconcile_issue(issue_id, issue, thread_entry, state, context) do
+  defp reconcile_issue(issue_id, issue, thread_entry, workspace_present, state, context) do
     case issue do
       %{state: issue_state} = issue when is_binary(issue_state) ->
         cond do
@@ -77,10 +78,10 @@ defmodule SymphonyElixir.TerminalReconciler do
             :ok
 
           active?(state, issue_id) ->
-            log_skip(issue, issue_id, "active_run")
+            log_skip(issue, issue_id, "active_run", not is_nil(thread_entry), workspace_present)
 
           context.pending_fun.(issue_id) ->
-            log_skip(issue, issue_id, "pending_handoff")
+            log_skip(issue, issue_id, "pending_handoff", not is_nil(thread_entry), workspace_present)
 
           true ->
             reconcile_worktree(issue, context.workspace_cleanup_fun)
@@ -122,12 +123,29 @@ defmodule SymphonyElixir.TerminalReconciler do
       MapSet.member?(Map.get(state, :claimed, MapSet.new()), issue_id)
   end
 
-  defp log_skip(issue, issue_id, reason) do
-    Logger.info("Terminal resource reconciliation issue_id=#{issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=preserved reason=#{reason}")
+  defp log_skip(issue, issue_id, reason, thread_present, workspace_present) do
+    if thread_present do
+      Logger.info("Terminal resource reconciliation issue_id=#{issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=preserved reason=#{reason}")
+    end
+
+    if workspace_present do
+      Logger.info("Terminal resource reconciliation issue_id=#{issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=worktree action=remove result=preserved reason=#{reason}")
+    end
   end
 
   defp reconcile_worktree(issue, cleanup_fun) do
     case cleanup_fun.(issue.id) do
+      {:ok, :removed} ->
+        Logger.info("Terminal resource reconciliation issue_id=#{issue.id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=worktree action=remove result=ok reason=terminal")
+
+      {:ok, :already_removed} ->
+        Logger.info("Terminal resource reconciliation issue_id=#{issue.id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=worktree action=remove result=noop reason=already_removed")
+
+      {:ok, :missing} ->
+        Logger.info(
+          "Terminal resource reconciliation issue_id=#{issue.id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=worktree action=remove result=noop reason=missing_registry_entry"
+        )
+
       :ok ->
         Logger.info("Terminal resource reconciliation issue_id=#{issue.id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=worktree action=remove result=ok reason=terminal")
 

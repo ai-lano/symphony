@@ -31,8 +31,16 @@ defmodule SymphonyElixir.WorkspaceRegistry do
 
   @spec cleanup(String.t()) :: :ok | {:error, term()}
   def cleanup(issue_id) when is_binary(issue_id) do
+    case cleanup_result(issue_id) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec cleanup_result(String.t()) :: {:ok, :removed | :already_removed | :missing} | {:error, term()}
+  def cleanup_result(issue_id) when is_binary(issue_id) do
     case fetch(issue_id) do
-      :missing -> :ok
+      :missing -> {:ok, :missing}
       {:ok, %{worker_host: worker_host}} when is_binary(worker_host) -> preserve(issue_id, :remote_workspace)
       {:ok, entry} -> cleanup_local(entry)
       {:error, reason} -> preserve(issue_id, reason)
@@ -59,13 +67,15 @@ defmodule SymphonyElixir.WorkspaceRegistry do
            :ok <- run_git(entry.common_dir, ["worktree", "remove", workspace]),
            :ok <- run_git(entry.common_dir, ["worktree", "prune"]),
            :ok <- remove(entry.issue_id) do
-        Logger.info("Terminal resource reconciliation issue_id=#{entry.issue_id} lane=#{lane()} resource=worktree action=remove result=ok reason=terminal")
-        :ok
+        {:ok, :removed}
       else
         {:error, reason} -> preserve(entry.issue_id, reason)
       end
     else
-      remove(entry.issue_id)
+      case remove(entry.issue_id) do
+        :ok -> {:ok, :already_removed}
+        error -> error
+      end
     end
   end
 
@@ -158,8 +168,7 @@ defmodule SymphonyElixir.WorkspaceRegistry do
     end)
   end
 
-  defp preserve(issue_id, reason) do
-    Logger.warning("Terminal resource reconciliation issue_id=#{issue_id} lane=#{lane()} resource=worktree action=remove result=preserved reason=#{inspect(reason)}")
+  defp preserve(_issue_id, reason) do
     {:error, reason}
   end
 
