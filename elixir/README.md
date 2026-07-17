@@ -20,8 +20,17 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
-During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+During app-server sessions, Symphony serves two client-side Linear tools:
+
+- `linear_graphql` for raw queries, comments, labels, and other non-handoff operations.
+- `linear_issue_handoff` for the final issue-state transition. It persists the transition before
+  acknowledging the agent, retries transient failures, and prevents the same issue from being
+  redispatched while the handoff is pending.
+
+Linear GraphQL rate limits arrive as HTTP 400 responses with an embedded `RATELIMITED` error.
+Symphony honors Linear reset headers (or the response duration), persists a token-scoped retry
+deadline, and suppresses requests until that deadline. Services sharing the same API key and
+`SYMPHONY_STATE_DIR` therefore share the same local backoff gate.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -84,6 +93,11 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
+
+Optional environment:
+
+- `SYMPHONY_STATE_DIR` sets the writable directory for the shared Linear rate-limit gate and
+  workflow-scoped pending handoffs. It defaults to `~/.local/state/symphony`.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.

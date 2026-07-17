@@ -317,6 +317,8 @@ defmodule SymphonyElixir.StatusDashboard do
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
+             linear_rate_limit: Map.get(snapshot, :linear_rate_limit),
+             pending_handoffs: Map.get(snapshot, :pending_handoffs, []),
              polling: Map.get(snapshot, :polling)
            }},
           update_token_samples(token_samples, now_ms, total_tokens)
@@ -334,6 +336,9 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
+        linear_rate_limit = Map.get(snapshot, :linear_rate_limit)
+        pending_handoffs = Map.get(snapshot, :pending_handoffs, [])
+        linear_health_lines = format_linear_health_lines(linear_rate_limit, length(pending_handoffs))
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -363,6 +368,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           linear_health_lines,
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
@@ -426,6 +432,27 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_project_refresh_line(_) do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
+
+  defp format_linear_health_lines(%{retry_after_ms: retry_after_ms}, pending_count)
+       when is_integer(retry_after_ms) do
+    seconds = div(max(retry_after_ms, 0) + 999, 1_000)
+
+    [
+      colorize("│ Linear: ", @ansi_bold) <>
+        colorize("rate-limited (retry #{seconds}s)", @ansi_red) <>
+        colorize(" | pending handoffs #{pending_count}", @ansi_yellow)
+    ]
+  end
+
+  defp format_linear_health_lines(_rate_limit, pending_count) when pending_count > 0 do
+    [
+      colorize("│ Linear: ", @ansi_bold) <>
+        colorize("healthy", @ansi_green) <>
+        colorize(" | pending handoffs #{pending_count}", @ansi_yellow)
+    ]
+  end
+
+  defp format_linear_health_lines(_rate_limit, _pending_count), do: []
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
 

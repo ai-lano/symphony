@@ -3,9 +3,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.{Client, PendingHandoff}
 
   @linear_graphql_tool "linear_graphql"
+  @linear_issue_handoff_tool "linear_issue_handoff"
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
   """
@@ -25,12 +26,33 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   }
+  @linear_issue_handoff_description """
+  Durably hand an issue to another Linear workflow state. The transition is persisted before acknowledgement and retried without redispatching the agent.
+  """
+  @linear_issue_handoff_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["issue_id", "state_name"],
+    "properties" => %{
+      "issue_id" => %{
+        "type" => "string",
+        "description" => "Linear issue UUID, not the human-readable identifier."
+      },
+      "state_name" => %{
+        "type" => "string",
+        "description" => "Exact target workflow state name, such as In Review or Todo."
+      }
+    }
+  }
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
+
+      @linear_issue_handoff_tool ->
+        execute_linear_issue_handoff(arguments, opts)
 
       other ->
         failure_response(%{
@@ -49,8 +71,58 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
+      },
+      %{
+        "name" => @linear_issue_handoff_tool,
+        "description" => @linear_issue_handoff_description,
+        "inputSchema" => @linear_issue_handoff_input_schema
       }
     ]
+  end
+
+  defp execute_linear_issue_handoff(arguments, opts) when is_map(arguments) do
+    handoff_fun = Keyword.get(opts, :handoff_fun, &PendingHandoff.enqueue/2)
+    issue_id = Map.get(arguments, "issue_id") || Map.get(arguments, :issue_id)
+    state_name = Map.get(arguments, "state_name") || Map.get(arguments, :state_name)
+
+    with true <- is_binary(issue_id) and String.trim(issue_id) != "",
+         true <- is_binary(state_name) and String.trim(state_name) != "",
+         {:ok, :queued} <- handoff_fun.(issue_id, state_name) do
+      dynamic_tool_response(
+        true,
+        encode_payload(%{
+          "handoff" => %{
+            "issue_id" => issue_id,
+            "state_name" => state_name,
+            "status" => "queued",
+            "durable" => true
+          }
+        })
+      )
+    else
+      false ->
+        failure_response(%{
+          "error" => %{
+            "message" => "`linear_issue_handoff` requires non-empty `issue_id` and `state_name` strings."
+          }
+        })
+
+      {:error, reason} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "Failed to persist the Linear issue handoff.",
+            "reason" => inspect(reason)
+          }
+        })
+    end
+  end
+
+  defp execute_linear_issue_handoff(_arguments, _opts) do
+    failure_response(%{
+      "error" => %{
+        "message" => "`linear_issue_handoff` expects an object with `issue_id` and `state_name`."
+      }
+    })
   end
 
   defp execute_linear_graphql(arguments, opts) do
@@ -181,6 +253,17 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "error" => %{
         "message" => "Linear GraphQL request failed with HTTP #{status}.",
         "status" => status
+      }
+    }
+  end
+
+  defp tool_error_payload({:linear_rate_limited, details}) do
+    %{
+      "error" => %{
+        "code" => "LINEAR_RATE_LIMITED",
+        "message" => "Linear is rate limited. Do not retry this tool call; use `linear_issue_handoff` for the final state transition.",
+        "retryAfterMs" => details.retry_after_ms,
+        "retryAtUnixMs" => details.retry_at_unix_ms
       }
     }
   end

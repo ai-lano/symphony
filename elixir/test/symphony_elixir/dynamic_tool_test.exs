@@ -16,10 +16,19 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                  "type" => "object"
                },
                "name" => "linear_graphql"
+             },
+             %{
+               "description" => handoff_description,
+               "inputSchema" => %{
+                 "required" => ["issue_id", "state_name"],
+                 "type" => "object"
+               },
+               "name" => "linear_issue_handoff"
              }
            ] = DynamicTool.tool_specs()
 
     assert description =~ "Linear"
+    assert handoff_description =~ "Durably"
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -30,7 +39,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => ["linear_graphql", "linear_issue_handoff"]
              }
            }
 
@@ -40,6 +49,47 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "text" => response["output"]
              }
            ]
+  end
+
+  test "linear_issue_handoff acknowledges only after durable enqueue" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_issue_handoff",
+        %{"issue_id" => "issue-1", "state_name" => "In Review"},
+        handoff_fun: fn issue_id, state_name ->
+          send(test_pid, {:handoff_enqueued, issue_id, state_name})
+          {:ok, :queued}
+        end
+      )
+
+    assert_received {:handoff_enqueued, "issue-1", "In Review"}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "handoff" => %{
+               "durable" => true,
+               "issue_id" => "issue-1",
+               "state_name" => "In Review",
+               "status" => "queued"
+             }
+           }
+  end
+
+  test "linear_issue_handoff rejects invalid input and persistence failures" do
+    invalid = DynamicTool.execute("linear_issue_handoff", %{"issue_id" => "", "state_name" => "Todo"})
+    assert invalid["success"] == false
+
+    failed =
+      DynamicTool.execute(
+        "linear_issue_handoff",
+        %{"issue_id" => "issue-1", "state_name" => "Todo"},
+        handoff_fun: fn _issue_id, _state_name -> {:error, :disk_full} end
+      )
+
+    assert failed["success"] == false
+    assert Jason.decode!(failed["output"])["error"]["reason"] =~ "disk_full"
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do
@@ -274,6 +324,35 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              "error" => %{
                "message" => "Linear GraphQL request failed before receiving a successful response.",
                "reason" => ":timeout"
+             }
+           }
+  end
+
+  test "linear_graphql exposes structured rate-limit guidance without encouraging retries" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "mutation Update { issueUpdate(id: \"issue-1\", input: {}) { success } }"},
+        linear_client: fn _query, _variables, _opts ->
+          {:error,
+           {:linear_rate_limited,
+            %{
+              retry_after_ms: 60_000,
+              retry_at_unix_ms: 70_000,
+              attempt: 1,
+              source: "test"
+            }}}
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "code" => "LINEAR_RATE_LIMITED",
+               "message" => "Linear is rate limited. Do not retry this tool call; use `linear_issue_handoff` for the final state transition.",
+               "retryAfterMs" => 60_000,
+               "retryAtUnixMs" => 70_000
              }
            }
   end
