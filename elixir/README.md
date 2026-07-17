@@ -96,8 +96,11 @@ Optional flags:
 
 Optional environment:
 
-- `SYMPHONY_STATE_DIR` sets the writable directory for the shared Linear rate-limit gate and
-  workflow-scoped pending handoffs. It defaults to `~/.local/state/symphony`.
+- `SYMPHONY_STATE_DIR` sets the writable directory for the shared Linear rate-limit gate,
+  workflow-scoped pending handoffs, and workflow-scoped per-issue Codex thread ids. It defaults to
+  `~/.local/state/symphony`. A later run of the same workflow lane and issue resumes the recorded
+  Codex thread; Worker and Reviewer lanes remain isolated because each workflow has its own registry
+  namespace.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.

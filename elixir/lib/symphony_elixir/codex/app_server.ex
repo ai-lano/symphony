@@ -4,10 +4,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Codex.{DynamicTool, ThreadRegistry}
+  alias SymphonyElixir.{Config, PathSafety, SSH, Workflow}
 
   @initialize_id 1
   @thread_start_id 2
+  @thread_resume_id 4
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
@@ -21,6 +23,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          thread_disposition: :started | :resumed | :fallback,
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
@@ -39,13 +42,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    issue = Keyword.get(opts, :issue)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id, thread_disposition} <-
+             do_start_session(
+               port,
+               expanded_workspace,
+               session_policies,
+               issue,
+               worker_host
+             ) do
         {:ok,
          %{
            port: port,
@@ -55,6 +66,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
+           thread_disposition: thread_disposition,
            workspace: expanded_workspace,
            worker_host: worker_host
          }}
@@ -75,6 +87,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          thread_disposition: thread_disposition,
           workspace: workspace
         },
         prompt,
@@ -99,6 +112,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
+            thread_disposition: thread_disposition,
             turn_id: turn_id
           },
           metadata
@@ -270,11 +284,126 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, issue, worker_host) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> open_thread(port, workspace, session_policies, issue, worker_host)
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp open_thread(
+         port,
+         workspace,
+         session_policies,
+         %{id: issue_id} = issue,
+         worker_host
+       )
+       when is_binary(issue_id) do
+    case ThreadRegistry.fetch_entry(issue_id) do
+      {:ok, %{thread_id: thread_id, worker_host: ^worker_host}} ->
+        resume_or_replace_thread(
+          port,
+          workspace,
+          session_policies,
+          issue,
+          thread_id,
+          worker_host
+        )
+
+      {:ok, %{worker_host: persisted_worker_host}} ->
+        {:error, {:thread_worker_host_mismatch, issue_id, persisted_worker_host, worker_host}}
+
+      :missing ->
+        start_and_persist_thread(
+          port,
+          workspace,
+          session_policies,
+          issue,
+          worker_host,
+          :started
+        )
+
+      {:error, reason} ->
+        Logger.warning(
+          "Codex thread registry recovery for #{issue_context(issue)} " <>
+            "lane=#{inspect(Workflow.workflow_file_path())} reason=#{inspect(reason)}"
+        )
+
+        start_and_persist_thread(
+          port,
+          workspace,
+          session_policies,
+          issue,
+          worker_host,
+          :fallback
+        )
+    end
+  end
+
+  defp open_thread(port, workspace, session_policies, _issue, _worker_host) do
+    with {:ok, thread_id} <- start_thread(port, workspace, session_policies) do
+      {:ok, thread_id, :started}
+    end
+  end
+
+  defp resume_or_replace_thread(
+         port,
+         workspace,
+         session_policies,
+         issue,
+         thread_id,
+         worker_host
+       ) do
+    case resume_thread(port, workspace, session_policies, thread_id) do
+      {:ok, ^thread_id} ->
+        log_thread_opened(issue, thread_id, :resumed)
+        {:ok, thread_id, :resumed}
+
+      {:ok, resumed_thread_id} ->
+        {:error, {:unexpected_resumed_thread_id, thread_id, resumed_thread_id}}
+
+      {:error, reason} ->
+        if recoverable_resume_error?(reason) do
+          Logger.warning(
+            "Codex thread resume fallback for #{issue_context(issue)} " <>
+              "lane=#{inspect(Workflow.workflow_file_path())} thread_id=#{thread_id} " <>
+              "reason=#{inspect(reason)}"
+          )
+
+          start_and_persist_thread(
+            port,
+            workspace,
+            session_policies,
+            issue,
+            worker_host,
+            :fallback
+          )
+        else
+          {:error, reason}
+        end
+    end
+  end
+
+  defp start_and_persist_thread(
+         port,
+         workspace,
+         session_policies,
+         %{id: issue_id} = issue,
+         worker_host,
+         disposition
+       ) do
+    with {:ok, thread_id} <- start_thread(port, workspace, session_policies),
+         :ok <- ThreadRegistry.put(issue_id, thread_id, worker_host) do
+      log_thread_opened(issue, thread_id, disposition)
+      {:ok, thread_id, disposition}
+    end
+  end
+
+  defp log_thread_opened(issue, thread_id, disposition) do
+    Logger.info(
+      "Codex thread #{disposition} for #{issue_context(issue)} " <>
+        "lane=#{inspect(Workflow.workflow_file_path())} thread_id=#{thread_id}"
+    )
   end
 
   defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
@@ -300,6 +429,66 @@ defmodule SymphonyElixir.Codex.AppServer do
         other
     end
   end
+
+  defp resume_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         thread_id
+       ) do
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_resume_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "approvalPolicy" => approval_policy,
+        "sandbox" => thread_sandbox,
+        "cwd" => workspace
+      }
+    })
+
+    case await_response(port, @thread_resume_id) do
+      {:ok, %{"thread" => %{"id" => resumed_thread_id}}} -> {:ok, resumed_thread_id}
+      {:ok, thread_payload} -> {:error, {:invalid_thread_payload, thread_payload}}
+      other -> other
+    end
+  end
+
+  defp recoverable_resume_error?({:response_error, error}) do
+    normalized = response_error_text(error)
+
+    Enum.any?(
+      [
+        "thread not found",
+        "rollout not found",
+        "thread does not exist",
+        "rollout does not exist",
+        "no rollout found",
+        "failed to find rollout",
+        "invalid thread id",
+        "invalid threadid",
+        "corrupt thread rollout",
+        "corrupted thread rollout"
+      ],
+      &String.contains?(normalized, &1)
+    )
+  end
+
+  defp recoverable_resume_error?(_reason), do: false
+
+  defp response_error_text(error) when is_map(error) do
+    [
+      Map.get(error, "message"),
+      Map.get(error, :message),
+      Map.get(error, "data"),
+      Map.get(error, :data)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map_join(" ", &inspect/1)
+    |> String.downcase()
+  end
+
+  defp response_error_text(error), do: error |> inspect() |> String.downcase()
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{

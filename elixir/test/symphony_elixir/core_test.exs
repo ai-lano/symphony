@@ -874,6 +874,36 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "persisted thread host remains the strict dispatch affinity after restart" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    assert :ok =
+             ThreadRegistry.put(
+               "issue-affinity",
+               "thread-affinity",
+               "worker-b"
+             )
+
+    assert Orchestrator.select_worker_host_for_issue_for_test(
+             %Orchestrator.State{running: %{}},
+             "issue-affinity",
+             nil
+           ) == "worker-b"
+
+    state_with_full_affinity_host = %Orchestrator.State{
+      running: %{"other-issue" => %{worker_host: "worker-b"}}
+    }
+
+    assert Orchestrator.select_worker_host_for_issue_for_test(
+             state_with_full_affinity_host,
+             "issue-affinity",
+             "worker-a"
+           ) == :no_worker_capacity
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
