@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Codex.ThreadRegistry, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.Linear.{PendingHandoff, RateLimiter}
 
@@ -410,6 +410,14 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec select_worker_host_for_issue_for_test(term(), String.t(), String.t() | nil) ::
+          String.t() | nil | :no_worker_capacity
+  def select_worker_host_for_issue_for_test(%State{} = state, issue_id, preferred_worker_host)
+      when is_binary(issue_id) do
+    select_worker_host_for_issue(state, issue_id, preferred_worker_host)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -761,6 +769,7 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
+      thread_disposition: Map.get(running_entry, :thread_disposition),
       error: error,
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
@@ -941,7 +950,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
+    case select_worker_host_for_issue(state, issue.id, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
@@ -969,6 +978,7 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            thread_disposition: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1194,7 +1204,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
+         worker_slots_available_for_issue?(
+           state,
+           issue.id,
+           metadata[:worker_host]
+         ) do
       {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
@@ -1297,6 +1311,34 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp select_worker_host_for_issue(%State{} = state, issue_id, preferred_worker_host)
+       when is_binary(issue_id) do
+    case ThreadRegistry.fetch_entry(issue_id) do
+      {:ok, %{worker_host: persisted_worker_host}} ->
+        select_persisted_worker_host(state, persisted_worker_host)
+
+      _ ->
+        select_worker_host(state, preferred_worker_host)
+    end
+  end
+
+  defp select_persisted_worker_host(%State{} = state, persisted_worker_host) do
+    configured_hosts = Config.settings!().worker.ssh_hosts
+
+    cond do
+      is_nil(persisted_worker_host) and configured_hosts == [] ->
+        nil
+
+      is_binary(persisted_worker_host) and
+        persisted_worker_host in configured_hosts and
+          worker_host_slots_available?(state, persisted_worker_host) ->
+        persisted_worker_host
+
+      true ->
+        :no_worker_capacity
+    end
+  end
+
   defp preferred_worker_host_available?(preferred_worker_host, hosts)
        when is_binary(preferred_worker_host) and is_list(hosts) do
     preferred_worker_host != "" and preferred_worker_host in hosts
@@ -1324,8 +1366,14 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, nil) != :no_worker_capacity
   end
 
-  defp worker_slots_available?(%State{} = state, preferred_worker_host) do
-    select_worker_host(state, preferred_worker_host) != :no_worker_capacity
+  defp worker_slots_available_for_issue?(
+         %State{} = state,
+         issue_id,
+         preferred_worker_host
+       )
+       when is_binary(issue_id) do
+    select_worker_host_for_issue(state, issue_id, preferred_worker_host) !=
+      :no_worker_capacity
   end
 
   defp worker_host_slots_available?(%State{} = state, worker_host) when is_binary(worker_host) do
@@ -1420,6 +1468,7 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
+          thread_disposition: Map.get(metadata, :thread_disposition),
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
@@ -1459,6 +1508,7 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: Map.get(metadata, :session_id),
+          thread_disposition: Map.get(metadata, :thread_disposition),
           error: Map.get(metadata, :error),
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
@@ -1515,12 +1565,14 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    thread_disposition = Map.get(running_entry, :thread_disposition)
 
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        thread_disposition: thread_disposition_for_update(thread_disposition, update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1552,6 +1604,15 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp thread_disposition_for_update(_existing, %{
+         event: :session_started,
+         thread_disposition: disposition
+       })
+       when disposition in [:started, :resumed, :fallback],
+       do: disposition
+
+  defp thread_disposition_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

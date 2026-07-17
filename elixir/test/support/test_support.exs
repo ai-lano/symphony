@@ -9,6 +9,7 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.AgentRunner
       alias SymphonyElixir.CLI
       alias SymphonyElixir.Codex.AppServer
+      alias SymphonyElixir.Codex.ThreadRegistry
       alias SymphonyElixir.Config
       alias SymphonyElixir.HttpServer
       alias SymphonyElixir.Linear.Client

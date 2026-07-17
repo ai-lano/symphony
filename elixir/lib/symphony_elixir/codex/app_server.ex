@@ -50,7 +50,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id, thread_disposition} <-
-             do_start_session(port, expanded_workspace, session_policies, issue) do
+             do_start_session(
+               port,
+               expanded_workspace,
+               session_policies,
+               issue,
+               worker_host
+             ) do
         {:ok,
          %{
            port: port,
@@ -278,21 +284,44 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, issue) do
+  defp do_start_session(port, workspace, session_policies, issue, worker_host) do
     case send_initialize(port) do
-      :ok -> open_thread(port, workspace, session_policies, issue)
+      :ok -> open_thread(port, workspace, session_policies, issue, worker_host)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp open_thread(port, workspace, session_policies, %{id: issue_id} = issue)
+  defp open_thread(
+         port,
+         workspace,
+         session_policies,
+         %{id: issue_id} = issue,
+         worker_host
+       )
        when is_binary(issue_id) do
-    case ThreadRegistry.fetch(issue_id) do
-      {:ok, thread_id} ->
-        resume_or_replace_thread(port, workspace, session_policies, issue, thread_id)
+    case ThreadRegistry.fetch_entry(issue_id) do
+      {:ok, %{thread_id: thread_id, worker_host: ^worker_host}} ->
+        resume_or_replace_thread(
+          port,
+          workspace,
+          session_policies,
+          issue,
+          thread_id,
+          worker_host
+        )
+
+      {:ok, %{worker_host: persisted_worker_host}} ->
+        {:error, {:thread_worker_host_mismatch, issue_id, persisted_worker_host, worker_host}}
 
       :missing ->
-        start_and_persist_thread(port, workspace, session_policies, issue, :started)
+        start_and_persist_thread(
+          port,
+          workspace,
+          session_policies,
+          issue,
+          worker_host,
+          :started
+        )
 
       {:error, reason} ->
         Logger.warning(
@@ -300,17 +329,31 @@ defmodule SymphonyElixir.Codex.AppServer do
             "lane=#{inspect(Workflow.workflow_file_path())} reason=#{inspect(reason)}"
         )
 
-        start_and_persist_thread(port, workspace, session_policies, issue, :fallback)
+        start_and_persist_thread(
+          port,
+          workspace,
+          session_policies,
+          issue,
+          worker_host,
+          :fallback
+        )
     end
   end
 
-  defp open_thread(port, workspace, session_policies, _issue) do
+  defp open_thread(port, workspace, session_policies, _issue, _worker_host) do
     with {:ok, thread_id} <- start_thread(port, workspace, session_policies) do
       {:ok, thread_id, :started}
     end
   end
 
-  defp resume_or_replace_thread(port, workspace, session_policies, issue, thread_id) do
+  defp resume_or_replace_thread(
+         port,
+         workspace,
+         session_policies,
+         issue,
+         thread_id,
+         worker_host
+       ) do
     case resume_thread(port, workspace, session_policies, thread_id) do
       {:ok, ^thread_id} ->
         log_thread_opened(issue, thread_id, :resumed)
@@ -327,7 +370,14 @@ defmodule SymphonyElixir.Codex.AppServer do
               "reason=#{inspect(reason)}"
           )
 
-          start_and_persist_thread(port, workspace, session_policies, issue, :fallback)
+          start_and_persist_thread(
+            port,
+            workspace,
+            session_policies,
+            issue,
+            worker_host,
+            :fallback
+          )
         else
           {:error, reason}
         end
@@ -339,10 +389,11 @@ defmodule SymphonyElixir.Codex.AppServer do
          workspace,
          session_policies,
          %{id: issue_id} = issue,
+         worker_host,
          disposition
        ) do
     with {:ok, thread_id} <- start_thread(port, workspace, session_policies),
-         :ok <- ThreadRegistry.put(issue_id, thread_id) do
+         :ok <- ThreadRegistry.put(issue_id, thread_id, worker_host) do
       log_thread_opened(issue, thread_id, disposition)
       {:ok, thread_id, disposition}
     end
@@ -404,19 +455,40 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp recoverable_resume_error?({:response_error, error}) do
-    normalized =
-      error
-      |> inspect()
-      |> String.downcase()
+    normalized = response_error_text(error)
 
-    (String.contains?(normalized, "thread") or String.contains?(normalized, "rollout")) and
-      Enum.any?(
-        ["not found", "missing", "invalid", "corrupt", "does not exist", "no rollout"],
-        &String.contains?(normalized, &1)
-      )
+    Enum.any?(
+      [
+        "thread not found",
+        "rollout not found",
+        "thread does not exist",
+        "rollout does not exist",
+        "no rollout found",
+        "failed to find rollout",
+        "invalid thread id",
+        "invalid threadid",
+        "corrupt thread rollout",
+        "corrupted thread rollout"
+      ],
+      &String.contains?(normalized, &1)
+    )
   end
 
   defp recoverable_resume_error?(_reason), do: false
+
+  defp response_error_text(error) when is_map(error) do
+    [
+      Map.get(error, "message"),
+      Map.get(error, :message),
+      Map.get(error, "data"),
+      Map.get(error, :data)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map_join(" ", &inspect/1)
+    |> String.downcase()
+  end
+
+  defp response_error_text(error), do: error |> inspect() |> String.downcase()
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{

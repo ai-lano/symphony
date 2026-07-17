@@ -8,10 +8,21 @@ defmodule SymphonyElixir.Codex.ThreadRegistry do
 
   alias SymphonyElixir.Workflow
 
+  @type worker_host :: String.t() | nil
+  @type entry :: %{thread_id: String.t(), worker_host: worker_host()}
   @type fetch_result :: {:ok, String.t()} | :missing | {:error, term()}
+  @type fetch_entry_result :: {:ok, entry()} | :missing | {:error, term()}
 
   @spec fetch(String.t()) :: fetch_result()
   def fetch(issue_id) when is_binary(issue_id) do
+    case fetch_entry(issue_id) do
+      {:ok, %{thread_id: thread_id}} -> {:ok, thread_id}
+      other -> other
+    end
+  end
+
+  @spec fetch_entry(String.t()) :: fetch_entry_result()
+  def fetch_entry(issue_id) when is_binary(issue_id) do
     path = path_for(issue_id)
 
     case File.read(path) do
@@ -28,6 +39,13 @@ defmodule SymphonyElixir.Codex.ThreadRegistry do
 
   @spec put(String.t(), String.t()) :: :ok | {:error, term()}
   def put(issue_id, thread_id) when is_binary(issue_id) and is_binary(thread_id) do
+    put(issue_id, thread_id, nil)
+  end
+
+  @spec put(String.t(), String.t(), worker_host()) :: :ok | {:error, term()}
+  def put(issue_id, thread_id, worker_host)
+      when is_binary(issue_id) and is_binary(thread_id) and
+             (is_binary(worker_host) or is_nil(worker_host)) do
     path = path_for(issue_id)
     temporary = path <> ".tmp-#{System.unique_integer([:positive])}"
 
@@ -35,7 +53,8 @@ defmodule SymphonyElixir.Codex.ThreadRegistry do
       Jason.encode!(%{
         "version" => 1,
         "issue_id" => issue_id,
-        "thread_id" => thread_id
+        "thread_id" => thread_id,
+        "worker_host" => worker_host
       })
 
     with :ok <- File.mkdir_p(Path.dirname(path)),
@@ -66,10 +85,12 @@ defmodule SymphonyElixir.Codex.ThreadRegistry do
        %{
          "version" => 1,
          "issue_id" => ^expected_issue_id,
-         "thread_id" => thread_id
+         "thread_id" => thread_id,
+         "worker_host" => worker_host
        }}
-      when is_binary(thread_id) and byte_size(thread_id) > 0 ->
-        {:ok, thread_id}
+      when is_binary(thread_id) and byte_size(thread_id) > 0 and
+             (is_binary(worker_host) or is_nil(worker_host)) ->
+        {:ok, %{thread_id: thread_id, worker_host: worker_host}}
 
       _ ->
         {:error, :invalid_registry_entry}

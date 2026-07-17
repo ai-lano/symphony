@@ -23,11 +23,18 @@ defmodule SymphonyElixir.ThreadRegistryTest do
 
   test "persists isolated issue thread ids across calls" do
     assert :missing = ThreadRegistry.fetch("issue-a")
-    assert :ok = ThreadRegistry.put("issue-a", "thread-a")
+    assert :ok = ThreadRegistry.put("issue-a", "thread-a", "worker-a")
     assert :ok = ThreadRegistry.put("issue-b", "thread-b")
 
     assert {:ok, "thread-a"} = ThreadRegistry.fetch("issue-a")
     assert {:ok, "thread-b"} = ThreadRegistry.fetch("issue-b")
+
+    assert {:ok, %{thread_id: "thread-a", worker_host: "worker-a"}} =
+             ThreadRegistry.fetch_entry("issue-a")
+
+    assert {:ok, %{thread_id: "thread-b", worker_host: nil}} =
+             ThreadRegistry.fetch_entry("issue-b")
+
     refute ThreadRegistry.path_for("issue-a") == ThreadRegistry.path_for("issue-b")
   end
 

@@ -73,6 +73,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        %{
          event: :session_started,
          session_id: "thread-live-turn-live",
+         thread_disposition: :resumed,
          timestamp: now
        }}
     )
@@ -92,6 +93,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.issue_id == issue_id
     assert snapshot_entry.issue_url == "https://example.org/issues/MT-188"
     assert snapshot_entry.session_id == "thread-live-turn-live"
+    assert snapshot_entry.thread_disposition == :resumed
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now
 

@@ -1,8 +1,6 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Codex.ThreadRegistry
-
   test "app server resumes the persisted issue thread in a later process" do
     test_root =
       Path.join(
@@ -155,6 +153,139 @@ defmodule SymphonyElixir.AppServerTest do
       assert log =~ "Codex thread resume fallback"
       assert log =~ "thread_id=thread-missing"
       assert {:ok, "thread-replacement"} = ThreadRegistry.fetch(issue.id)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails closed on non-missing resume errors" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-resume-fail-closed-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-FAIL-CLOSED")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE}"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":4,"error":{"code":-32000,"message":"Thread is in an invalid state while another turn is active"}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-unexpected"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-fail-closed",
+        identifier: "MT-FAIL-CLOSED",
+        title: "Preserve a valid thread on transient failure",
+        state: "In Progress"
+      }
+
+      assert :ok = ThreadRegistry.put(issue.id, "thread-valid")
+
+      assert {:error,
+              {:response_error,
+               %{
+                 "code" => -32_000,
+                 "message" => "Thread is in an invalid state while another turn is active"
+               }}} =
+               AppServer.run(workspace, "do not replace", issue, issue: issue)
+
+      assert {:ok, "thread-valid"} = ThreadRegistry.fetch(issue.id)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "\"method\":\"thread/resume\""
+      refute trace =~ "\"method\":\"thread/start\""
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server refuses to resume or replace a thread on another worker host" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-host-mismatch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-HOST-MISMATCH")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE}"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-host-mismatch",
+        identifier: "MT-HOST-MISMATCH",
+        title: "Keep thread host affinity",
+        state: "In Progress"
+      }
+
+      assert :ok =
+               ThreadRegistry.put(issue.id, "thread-remote", "worker-b")
+
+      assert {:error, {:thread_worker_host_mismatch, "issue-host-mismatch", "worker-b", nil}} =
+               AppServer.start_session(workspace, issue: issue)
+
+      trace = File.read!(trace_file)
+      refute trace =~ "\"method\":\"thread/resume\""
+      refute trace =~ "\"method\":\"thread/start\""
+      assert {:ok, "thread-remote"} = ThreadRegistry.fetch(issue.id)
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
