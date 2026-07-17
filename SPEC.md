@@ -83,7 +83,6 @@ Important boundary:
 3. `Issue Tracker Client`
    - Fetches candidate issues in active states.
    - Fetches current states for specific issue IDs (reconciliation).
-   - Fetches terminal-state issues during startup cleanup.
    - Normalizes tracker payloads into a stable issue model.
 
 4. `Orchestrator`
@@ -93,10 +92,10 @@ Important boundary:
    - Tracks session metrics and retry queue state.
 
 5. `Workspace Manager`
-   - Maps issue identifiers to workspace paths.
+   - Manages per-issue workspace paths.
    - Ensures per-issue workspace directories exist.
    - Runs workspace lifecycle hooks.
-   - Cleans workspaces for terminal issues.
+   - Registers lane-owned linked Git worktrees for terminal reconciliation.
 
 6. `Agent Runner`
    - Creates workspace.
@@ -697,14 +696,21 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Terminal resource cleanup is registry-driven: each lane batches current states
+  for its persisted thread and linked-worktree entries. Successful thread
+  archival removes only the active thread mapping; registered worktrees remain
+  independently retryable until safe removal succeeds. Path-inferred directory
+  cleanup MUST NOT be used by the integrated reconciler. The legacy external
+  cleanup timer remains a fallback through LAN-19 but MUST use the same safety
+  gates.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
 ### 8.1 Poll Loop
 
-At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
-then repeats every `polling.interval_ms`.
+At startup, the service validates config, reconciles the lane's registered terminal resources, schedules an
+immediate tick, and then repeats every `polling.interval_ms`. Reconciliation also runs on every bounded poll
+interval; it never scans tracker-wide terminal issues or infers worktree paths from issue identifiers.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.
 
@@ -779,10 +785,9 @@ Retry handling behavior:
 
 Note:
 
-- Terminal-state workspace cleanup is handled by startup cleanup and active-run reconciliation
-  (including terminal transitions for currently running issues).
-- Retry handling mainly operates on active candidates and releases claims when the issue is absent,
-  rather than performing terminal cleanup itself.
+- Terminal resource reconciliation is independent of candidate dispatch and retries. It examines only the
+  current lane's persisted thread and linked-worktree registrations, reads those issue IDs in bounded batches,
+  and applies the terminal safety gate.
 
 ### 8.5 Active Run Reconciliation
 
@@ -800,20 +805,29 @@ Part B: Tracker state refresh
 
 - Fetch current issue states for all running issue IDs.
 - For each running issue:
-  - If tracker state is terminal: terminate worker and clean workspace.
+  - If tracker state is terminal: terminate the worker. The registered-resource reconciler cleans only after
+    the run and any pending handoff/reservation have cleared.
   - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
-### 8.6 Startup Terminal Workspace Cleanup
+### 8.6 Terminal Resource Reconciliation
 
-When the service starts:
+At startup and on each poll interval, each lane reconciles only its persisted thread and linked-worktree
+registrations:
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
+1. Collect registered issue IDs and fetch their current states in bounded batches.
+2. For a terminal state, preserve resources while an active run, claim, blocked reservation, or pending handoff
+   exists.
+3. Archive a lane-owned Codex thread with `thread/archive`; retain its active mapping if archiving fails.
+4. Remove only a registered, local linked Git worktree that is clean, unlocked, on its recorded branch, and has a
+   live remote-tracking upstream. Preserve unsafe, remote, dirty, locked, missing-metadata, or unexpected-branch
+   entries and log a structured warning.
+5. Treat an already absent worktree as a successful no-op. Never delete local or remote branches, and never
+   unarchive a thread when an issue reopens.
 
-This prevents stale terminal workspaces from accumulating after restarts.
+The legacy external cleanup timer remains a fallback during dogfood, but it must use the same registry and safety
+gate rather than a tracker-wide terminal query.
 
 ## 9. Workspace Management and Safety
 
@@ -1148,10 +1162,10 @@ An implementation MUST support these tracker adapter operations:
    - Return issues in configured active states for a configured project.
 
 2. `fetch_issues_by_states(state_names)`
-   - Used for startup terminal cleanup.
+   - OPTIONAL compatibility operation; it is not used by terminal resource reconciliation.
 
 3. `fetch_issue_states_by_ids(issue_ids)`
-   - Used for active-run reconciliation.
+   - Used for active-run and registered-resource reconciliation; callers batch bounded ID lists.
 
 ### 11.2 Query Semantics (Linear)
 
@@ -1208,7 +1222,7 @@ Orchestrator behavior on tracker errors:
 
 - Candidate fetch failure: log and skip dispatch for this tick.
 - Running-state refresh failure: log and keep active workers running.
-- Startup terminal cleanup failure: log warning and continue startup.
+- Registered-resource refresh failure: log warning, preserve registry entries, and retry on the next interval.
 
 ### 11.5 Tracker Writes (Important Boundary)
 
@@ -1598,7 +1612,7 @@ After restart:
 - No retry timers are restored from prior process memory.
 - No running sessions are assumed recoverable.
 - Service recovers by:
-  - startup terminal workspace cleanup
+  - immediate registered-resource reconciliation for this lane
   - fresh polling of active issues
   - re-dispatching eligible work
 
@@ -1610,7 +1624,8 @@ Operators can control behavior by:
 - `WORKFLOW.md` changes are detected and re-applied automatically without restart according to
   Section 6.2.
 - Changing issue states in the tracker:
-  - terminal state -> running session is stopped and workspace cleaned when reconciled
+  - terminal state -> running session is stopped; registered lane-owned threads and safe worktrees are reconciled
+    after active/pending ownership clears
   - non-active state -> running session is stopped without cleanup
 - Restarting the service for process recovery or deployment (not as the normal path for applying
   workflow config changes).
@@ -1715,7 +1730,7 @@ function start_service():
     log_validation_error(validation)
     fail_startup(validation)
 
-  startup_terminal_workspace_cleanup()
+  reconcile_registered_terminal_resources(state)
   schedule_tick(delay_ms=0)
 
   event_loop(state)
@@ -1770,7 +1785,7 @@ function reconcile_running_issues(state):
 
   for issue in refreshed:
     if issue.state in terminal_states:
-      state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
+      state = terminate_running_issue(state, issue.id)
     else if issue.state in active_states:
       state.running[issue.id].issue = issue
     else:
@@ -1999,7 +2014,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `Todo` issue with terminal blockers is eligible
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
-- Terminal state stops running agent and cleans workspace
+- Terminal state stops the running agent; registered-resource reconciliation later archives the lane-owned thread
+  and removes only a safe registered worktree
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry (attempt 1)
 - Abnormal worker exit increments retries with 10s-based exponential backoff

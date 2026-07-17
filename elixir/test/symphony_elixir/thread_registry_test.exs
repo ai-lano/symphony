@@ -86,6 +86,19 @@ defmodule SymphonyElixir.ThreadRegistryTest do
     assert {:ok, "thread-stable"} = ThreadRegistry.fetch("issue-a")
   end
 
+  test "lists active entries and archives one into compact audit metadata" do
+    assert :ok = ThreadRegistry.put("issue-a", "thread-a", "worker-a")
+    assert :ok = ThreadRegistry.put("issue-b", "thread-b")
+
+    assert {:ok, entries} = ThreadRegistry.entries()
+    assert Enum.any?(entries, &(&1.issue_id == "issue-a" and &1.thread_id == "thread-a"))
+
+    archived_at = ~U[2026-07-17 00:00:00Z]
+    assert :ok = ThreadRegistry.archive("issue-a", "terminal:Done", archived_at)
+    assert :missing = ThreadRegistry.fetch("issue-a")
+    assert :ok = ThreadRegistry.archive("issue-a", "terminal:Done", archived_at)
+  end
+
   test "reports registry read and write failures", %{state_root: state_root} do
     read_path = ThreadRegistry.path_for("issue-read-error")
     File.mkdir_p!(read_path)

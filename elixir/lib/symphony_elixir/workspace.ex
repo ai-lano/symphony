@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, PathSafety, SSH, WorkspaceRegistry}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Workspace do
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+        maybe_register_worktree(issue_context.issue_id, workspace, worker_host)
         {:ok, workspace}
       end
     rescue
@@ -82,6 +83,16 @@ defmodule SymphonyElixir.Workspace do
     File.rm_rf!(workspace)
     File.mkdir_p!(workspace)
     {:ok, workspace, true}
+  end
+
+  defp maybe_register_worktree(issue_id, workspace, worker_host) do
+    case WorkspaceRegistry.register(issue_id, workspace, worker_host) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.debug("Workspace is not registered for terminal worktree cleanup issue_id=#{inspect(issue_id)} workspace=#{workspace} reason=#{inspect(reason)}")
+    end
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}

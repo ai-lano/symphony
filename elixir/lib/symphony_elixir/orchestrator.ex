@@ -7,7 +7,15 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Codex.ThreadRegistry, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Codex.ThreadRegistry,
+    Config,
+    StatusDashboard,
+    TerminalReconciler,
+    Tracker
+  }
+
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.Linear.{PendingHandoff, RateLimiter}
 
@@ -35,6 +43,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       :linear_rate_limit,
+      :now_fun,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -52,8 +61,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
-    now_ms = System.monotonic_time(:millisecond)
+  def init(opts) do
+    now_fun = Keyword.get(opts, :now_fun, fn -> System.monotonic_time(:millisecond) end)
+    now_ms = now_fun.()
     config = Config.settings!()
 
     state = %State{
@@ -64,11 +74,11 @@ defmodule SymphonyElixir.Orchestrator do
       tick_timer_ref: nil,
       tick_token: nil,
       linear_rate_limit: nil,
+      now_fun: now_fun,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -254,6 +264,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
+    :ok = TerminalReconciler.reconcile(state)
+
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
@@ -376,6 +388,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec reconcile_terminal_resources_for_test(map(), keyword()) :: :ok
+  def reconcile_terminal_resources_for_test(state, opts \\ []) when is_map(state) do
+    TerminalReconciler.reconcile(state, opts)
+  end
+
+  @doc false
   @spec handle_retry_issue_lookup_for_test(Issue.t(), term(), String.t(), non_neg_integer(), map()) ::
           term()
   def handle_retry_issue_lookup_for_test(%Issue{} = issue, %State{} = state, issue_id, attempt, metadata)
@@ -468,7 +486,6 @@ defmodule SymphonyElixir.Orchestrator do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        cleanup_issue_workspace(issue.identifier, blocked_issue_worker_host(state, issue.id))
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
@@ -562,19 +579,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(%State{} = state, issue_id, _cleanup_workspace) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
 
-      %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+      %{pid: pid, ref: ref} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
-        worker_host = Map.get(running_entry, :worker_host)
-
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
-        end
-
         stop_running_task(pid, ref)
 
         %{
@@ -1049,7 +1060,7 @@ defmodule SymphonyElixir.Orchestrator do
     delay_ms = retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+    due_at_ms = now_ms(state) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     issue_url = pick_retry_issue_url(previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
@@ -1148,7 +1159,6 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
@@ -1164,37 +1174,6 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
     {:noreply, release_issue_claim(state, issue_id)}
-  end
-
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
-
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
-  end
-
-  defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
-
-  defp blocked_issue_worker_host(%State{} = state, issue_id) do
-    state.blocked
-    |> Map.get(issue_id, %{})
-    |> Map.get(:worker_host)
-  end
-
-  defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
-      {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
-
-          _ ->
-            :ok
-        end)
-
-      {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
-    end
   end
 
   defp notify_dashboard do
@@ -1666,6 +1645,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp next_poll_in_ms(next_poll_due_at_ms, now_ms) when is_integer(next_poll_due_at_ms) do
     max(0, next_poll_due_at_ms - now_ms)
   end
+
+  defp now_ms(%State{now_fun: now_fun}) when is_function(now_fun, 0), do: now_fun.()
+  defp now_ms(_state), do: System.monotonic_time(:millisecond)
 
   defp next_poll_delay(%State{linear_rate_limit: details, poll_interval_ms: interval_ms}) do
     case RateLimiter.retry_after_ms({:linear_rate_limited, details}) do
