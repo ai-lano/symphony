@@ -1,6 +1,166 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.ThreadRegistry
+
+  test "app server resumes the persisted issue thread in a later process" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-resume-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-RESUME")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE}"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-persisted"}}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-persisted"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-ok"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-resume",
+        identifier: "MT-RESUME",
+        title: "Resume the issue thread",
+        state: "In Progress"
+      }
+
+      assert {:ok, %{thread_id: "thread-persisted"}} =
+               AppServer.run(workspace, "first round", issue, issue: issue)
+
+      assert {:ok, %{thread_id: "thread-persisted"}} =
+               AppServer.run(workspace, "second round", issue, issue: issue)
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.count(payloads, &(&1["method"] == "thread/start")) == 1
+      assert Enum.count(payloads, &(&1["method"] == "thread/resume")) == 1
+
+      assert Enum.any?(payloads, fn payload ->
+               payload["method"] == "thread/resume" &&
+                 get_in(payload, ["params", "threadId"]) == "thread-persisted" &&
+                 String.ends_with?(
+                   get_in(payload, ["params", "cwd"]),
+                   "/workspaces/MT-RESUME"
+                 )
+             end)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server replaces a missing persisted thread after a resume error" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-resume-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-FALLBACK")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE}"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":4,"error":{"code":-32000,"message":"Thread not found"}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-replacement"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-ok"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-fallback",
+        identifier: "MT-FALLBACK",
+        title: "Replace a missing thread",
+        state: "In Progress"
+      }
+
+      assert :ok = ThreadRegistry.put(issue.id, "thread-missing")
+
+      log =
+        capture_log(fn ->
+          assert {:ok, %{thread_id: "thread-replacement"}} =
+                   AppServer.run(workspace, "fallback round", issue, issue: issue)
+        end)
+
+      assert log =~ "Codex thread resume fallback"
+      assert log =~ "thread_id=thread-missing"
+      assert {:ok, "thread-replacement"} = ThreadRegistry.fetch(issue.id)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
