@@ -697,13 +697,19 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Terminal resource cleanup is registry-driven: each lane batches current states
+  for its persisted thread and linked-worktree entries. Successful thread
+  archival removes only the active thread mapping; registered worktrees remain
+  independently retryable until safe removal succeeds. Path-inferred directory
+  cleanup MUST NOT be used by the integrated reconciler. The legacy external
+  cleanup timer remains a fallback through LAN-19 but MUST use the same safety
+  gates.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
 ### 8.1 Poll Loop
 
-At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
+At startup, the service validates config, reconciles registered terminal resources, schedules an immediate tick, and
 then repeats every `polling.interval_ms`.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.

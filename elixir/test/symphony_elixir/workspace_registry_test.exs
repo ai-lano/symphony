@@ -21,7 +21,7 @@ defmodule SymphonyElixir.WorkspaceRegistryTest do
     git!(worktree, ["push", "-u", "origin", "issue-branch"])
 
     on_exit(fn -> File.rm_rf(root) end)
-    %{repo: repo, worktree: worktree}
+    %{repo: repo, remote: remote, worktree: worktree}
   end
 
   test "removes a clean registered linked worktree and treats a repeat as a no-op", %{worktree: worktree} do
@@ -45,7 +45,32 @@ defmodule SymphonyElixir.WorkspaceRegistryTest do
     assert File.exists?(worktree)
   end
 
+  test "preserves a worktree when its remote-tracking upstream is gone", %{repo: repo, worktree: worktree} do
+    assert :ok = WorkspaceRegistry.register("issue-4", worktree)
+    git!(repo, ["push", "origin", "--delete", "issue-branch"])
+    git!(worktree, ["fetch", "--prune", "origin"])
+    assert {:error, :missing_or_gone_upstream} = WorkspaceRegistry.cleanup("issue-4")
+    assert File.exists?(worktree)
+  end
+
+  test "skips malformed metadata while retaining valid registered worktrees", %{worktree: worktree} do
+    assert :ok = WorkspaceRegistry.register("issue-valid", worktree)
+    File.write!(Path.join(registry_directory(), "broken.json"), "{bad")
+
+    assert {:ok, [%{issue_id: "issue-valid"}]} = WorkspaceRegistry.entries()
+  end
+
   defp git!(cwd, args) do
     assert {_output, 0} = System.cmd("git", args, cd: cwd, stderr_to_stdout: true)
+  end
+
+  defp registry_directory do
+    workflow_key =
+      Workflow.workflow_file_path()
+      |> Path.expand()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    Path.join([System.fetch_env!("SYMPHONY_STATE_DIR"), "worktrees", workflow_key])
   end
 end

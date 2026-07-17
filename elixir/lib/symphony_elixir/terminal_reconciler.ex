@@ -83,7 +83,7 @@ defmodule SymphonyElixir.TerminalReconciler do
             log_skip(issue, issue_id, "pending_handoff")
 
           true ->
-            _ = context.workspace_cleanup_fun.(issue_id)
+            reconcile_worktree(issue, context.workspace_cleanup_fun)
             archive(thread_entry, issue, context.archive_fun, context.registry)
         end
 
@@ -98,12 +98,21 @@ defmodule SymphonyElixir.TerminalReconciler do
     case archive_fun.(entry.thread_id, entry.worker_host) do
       :ok ->
         case registry.archive(entry.issue_id, "terminal:#{issue.state}") do
-          :ok -> Logger.info("Terminal resource reconciliation issue_id=#{entry.issue_id} lane=#{lane()} resource=thread action=archive result=ok reason=terminal:#{issue.state}")
-          {:error, reason} -> Logger.warning("Terminal resource reconciliation issue_id=#{entry.issue_id} lane=#{lane()} resource=thread action=archive result=retry reason=#{inspect(reason)}")
+          :ok ->
+            Logger.info(
+              "Terminal resource reconciliation issue_id=#{entry.issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=ok thread_id=#{entry.thread_id} reason=terminal:#{issue.state}"
+            )
+
+          {:error, reason} ->
+            Logger.warning(
+              "Terminal resource reconciliation issue_id=#{entry.issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=retry thread_id=#{entry.thread_id} reason=#{inspect(reason)}"
+            )
         end
 
       {:error, reason} ->
-        Logger.warning("Terminal resource reconciliation issue_id=#{entry.issue_id} lane=#{lane()} resource=thread action=archive result=retry reason=#{inspect(reason)}")
+        Logger.warning(
+          "Terminal resource reconciliation issue_id=#{entry.issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=retry thread_id=#{entry.thread_id} reason=#{inspect(reason)}"
+        )
     end
   end
 
@@ -115,6 +124,18 @@ defmodule SymphonyElixir.TerminalReconciler do
 
   defp log_skip(issue, issue_id, reason) do
     Logger.info("Terminal resource reconciliation issue_id=#{issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=preserved reason=#{reason}")
+  end
+
+  defp reconcile_worktree(issue, cleanup_fun) do
+    case cleanup_fun.(issue.id) do
+      :ok ->
+        Logger.info("Terminal resource reconciliation issue_id=#{issue.id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=worktree action=remove result=ok reason=terminal")
+
+      {:error, reason} ->
+        Logger.warning(
+          "Terminal resource reconciliation issue_id=#{issue.id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=worktree action=remove result=preserved reason=#{inspect(reason)}"
+        )
+    end
   end
 
   defp terminal_state_set(nil), do: terminal_state_set(Config.settings!().tracker.terminal_states)

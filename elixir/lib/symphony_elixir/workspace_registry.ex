@@ -53,6 +53,7 @@ defmodule SymphonyElixir.WorkspaceRegistry do
   defp cleanup_local(%{workspace: workspace} = entry) do
     if File.exists?(workspace) do
       with :ok <- ensure_clean(entry),
+           :ok <- ensure_live_remote_upstream(entry),
            :ok <- ensure_registered(entry),
            :ok <- ensure_expected_branch(entry),
            :ok <- run_git(entry.common_dir, ["worktree", "remove", workspace]),
@@ -85,6 +86,23 @@ defmodule SymphonyElixir.WorkspaceRegistry do
     else
       false -> {:error, :unregistered_or_locked_worktree}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_live_remote_upstream(entry) do
+    with {:ok, branch} <- git_output(entry.workspace, ["branch", "--show-current"]),
+         branch = String.trim(branch),
+         {:ok, remote} <- git_output(entry.workspace, ["config", "--get", "branch.#{branch}.remote"]),
+         remote = String.trim(remote),
+         {:ok, _} <- git_output(entry.workspace, ["remote", "get-url", remote]),
+         {:ok, upstream} <- git_output(entry.workspace, ["rev-parse", "--abbrev-ref", "@{upstream}"]),
+         upstream = String.trim(upstream),
+         true <- String.starts_with?(upstream, remote <> "/"),
+         {:ok, _} <- git_output(entry.workspace, ["rev-parse", "--verify", "refs/remotes/#{upstream}"]) do
+      :ok
+    else
+      false -> {:error, :missing_or_local_upstream}
+      {:error, _reason} -> {:error, :missing_or_gone_upstream}
     end
   end
 
@@ -155,11 +173,17 @@ defmodule SymphonyElixir.WorkspaceRegistry do
 
   defp write(entry) do
     path = path_for(entry.issue_id)
+    temporary = path <> ".tmp-#{System.unique_integer([:positive])}"
     payload = Jason.encode!(Map.put(entry, :version, 1))
 
-    case File.mkdir_p(Path.dirname(path)) do
-      :ok -> File.write(path, payload)
-      error -> error
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(temporary, payload),
+         :ok <- File.rename(temporary, path) do
+      :ok
+    else
+      {:error, reason} ->
+        File.rm(temporary)
+        {:error, {:registry_write_failed, reason}}
     end
   end
 
@@ -201,12 +225,14 @@ defmodule SymphonyElixir.WorkspaceRegistry do
   defp read_entries(directory, names) do
     names
     |> Enum.filter(&String.ends_with?(&1, ".json"))
-    |> Enum.reduce_while({:ok, []}, fn name, {:ok, entries} ->
+    |> Enum.reduce({:ok, []}, fn name, {:ok, entries} ->
       with {:ok, raw} <- File.read(Path.join(directory, name)),
            {:ok, entry} <- decode_any(raw) do
-        {:cont, {:ok, [entry | entries]}}
+        {:ok, [entry | entries]}
       else
-        {:error, reason} -> {:halt, {:error, {:registry_read_failed, name, reason}}}
+        {:error, reason} ->
+          Logger.warning("Terminal resource reconciliation lane=#{lane()} resource=worktree action=read result=preserved reason=#{inspect({name, reason})}")
+          {:ok, entries}
       end
     end)
     |> then(fn

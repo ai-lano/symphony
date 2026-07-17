@@ -33,7 +33,10 @@ deadline, and suppresses requests until that deadline. Services sharing the same
 `SYMPHONY_STATE_DIR` therefore share the same local backoff gate.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
+Symphony stops the active agent first. Each workflow lane then reconciles its persisted Codex
+threads and registered linked Git worktrees on subsequent polls. Threads are archived; only clean,
+unlocked worktrees with a live synchronized remote-tracking upstream are removed. Dirty, missing,
+or otherwise unsafe worktrees are preserved and retried without path-inferred directory deletion.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
@@ -97,7 +100,8 @@ Optional flags:
 Optional environment:
 
 - `SYMPHONY_STATE_DIR` sets the writable directory for the shared Linear rate-limit gate,
-  workflow-scoped pending handoffs, and workflow-scoped per-issue Codex thread ids. It defaults to
+  workflow-scoped pending handoffs, per-issue Codex thread ids, and registered linked-worktree
+  metadata. It defaults to
   `~/.local/state/symphony`. A later run of the same workflow lane and issue resumes the recorded
   Codex thread; Worker and Reviewer lanes remain isolated because each workflow has its own registry
   namespace.
