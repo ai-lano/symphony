@@ -84,12 +84,12 @@ defmodule SymphonyElixir.TerminalReconciler do
             log_skip(issue, issue_id, "pending_handoff", not is_nil(thread_entry), workspace_present)
 
           true ->
-            reconcile_worktree(issue, context.workspace_cleanup_fun)
+            maybe_reconcile_worktree(workspace_present, issue, context.workspace_cleanup_fun)
             archive(thread_entry, issue, context.archive_fun, context.registry)
         end
 
       _ ->
-        Logger.warning("Terminal resource reconciliation skipped issue_id=#{issue_id} lane=#{lane()} resource=thread action=archive result=preserved reason=missing_issue_metadata")
+        log_missing_issue_metadata(issue_id, thread_entry, workspace_present)
     end
   end
 
@@ -133,6 +133,20 @@ defmodule SymphonyElixir.TerminalReconciler do
     end
   end
 
+  defp log_missing_issue_metadata(issue_id, thread_entry, workspace_present) do
+    if thread_entry do
+      Logger.warning(
+        "Terminal resource reconciliation skipped issue_id=#{issue_id} issue_identifier=unknown lane=#{lane()} resource=thread action=archive result=preserved thread_id=#{thread_entry.thread_id} reason=missing_issue_metadata"
+      )
+    end
+
+    if workspace_present do
+      Logger.warning(
+        "Terminal resource reconciliation skipped issue_id=#{issue_id} issue_identifier=unknown lane=#{lane()} resource=worktree action=remove result=preserved reason=missing_issue_metadata"
+      )
+    end
+  end
+
   defp reconcile_worktree(issue, cleanup_fun) do
     case cleanup_fun.(issue.id) do
       {:ok, :removed} ->
@@ -155,6 +169,9 @@ defmodule SymphonyElixir.TerminalReconciler do
         )
     end
   end
+
+  defp maybe_reconcile_worktree(true, issue, cleanup_fun), do: reconcile_worktree(issue, cleanup_fun)
+  defp maybe_reconcile_worktree(false, _issue, _cleanup_fun), do: :ok
 
   defp terminal_state_set(nil), do: terminal_state_set(Config.settings!().tracker.terminal_states)
   defp terminal_state_set(states), do: states |> Enum.map(&normalize/1) |> MapSet.new()

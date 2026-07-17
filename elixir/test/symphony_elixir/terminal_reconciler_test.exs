@@ -36,7 +36,7 @@ defmodule SymphonyElixir.TerminalReconcilerTest do
   test "archives a terminal lane-owned thread and removes its active mapping" do
     assert :ok = reconcile(%Orchestrator.State{})
     assert_received {:fetched, ["terminal"]}
-    assert_received {:workspace_cleanup, "terminal"}
+    refute_received {:workspace_cleanup, "terminal"}
     assert_received {:archive_call, "thread-1", nil}
     assert_received {:archived, "terminal", "terminal:Done"}
   end
@@ -103,6 +103,32 @@ defmodule SymphonyElixir.TerminalReconcilerTest do
     assert log =~ "action=remove"
     assert log =~ "result=noop"
     assert log =~ "reason=already_removed"
+  end
+
+  test "logs missing issue metadata for each registered resource without inventing another resource" do
+    Application.put_env(:symphony_elixir, :terminal_issues, [])
+
+    thread_log = capture_log(fn -> assert :ok = reconcile(%Orchestrator.State{}) end)
+
+    assert thread_log =~ "issue_id=terminal"
+    assert thread_log =~ "issue_identifier=unknown"
+    assert thread_log =~ "resource=thread"
+    assert thread_log =~ "thread_id=thread-1"
+    assert thread_log =~ "reason=missing_issue_metadata"
+    refute thread_log =~ "resource=worktree"
+    refute_received {:workspace_cleanup, "terminal"}
+
+    Application.put_env(:symphony_elixir, :terminal_entries, {:ok, []})
+    Application.put_env(:symphony_elixir, :terminal_workspaces, {:ok, [%{issue_id: "terminal"}]})
+
+    worktree_log = capture_log(fn -> assert :ok = reconcile(%Orchestrator.State{}) end)
+
+    assert worktree_log =~ "issue_id=terminal"
+    assert worktree_log =~ "issue_identifier=unknown"
+    assert worktree_log =~ "resource=worktree"
+    assert worktree_log =~ "reason=missing_issue_metadata"
+    refute worktree_log =~ "resource=thread"
+    refute_received {:workspace_cleanup, "terminal"}
   end
 
   defp reconcile(state, overrides \\ []) do
