@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   alias SymphonyElixir.Linear.{Client, PendingHandoff}
+  alias SymphonyElixir.Workspace
 
   @linear_graphql_tool "linear_graphql"
   @linear_issue_handoff_tool "linear_issue_handoff"
@@ -82,11 +83,18 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp execute_linear_issue_handoff(arguments, opts) when is_map(arguments) do
     handoff_fun = Keyword.get(opts, :handoff_fun, &PendingHandoff.enqueue/2)
+
+    handoff_guard_fun =
+      Keyword.get(opts, :handoff_guard_fun, fn issue_id, state_name ->
+        run_handoff_guard(issue_id, state_name, opts)
+      end)
+
     issue_id = Map.get(arguments, "issue_id") || Map.get(arguments, :issue_id)
     state_name = Map.get(arguments, "state_name") || Map.get(arguments, :state_name)
 
     with true <- is_binary(issue_id) and String.trim(issue_id) != "",
          true <- is_binary(state_name) and String.trim(state_name) != "",
+         :ok <- handoff_guard_fun.(issue_id, state_name),
          {:ok, :queued} <- handoff_fun.(issue_id, state_name) do
       dynamic_tool_response(
         true,
@@ -107,6 +115,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
           }
         })
 
+      {:error, {:handoff_guard_failed, reason}} ->
+        failure_response(%{
+          "error" => %{
+            "message" => "The pre-handoff gate failed; the issue state was not queued.",
+            "reason" => inspect(reason)
+          }
+        })
+
       {:error, reason} ->
         failure_response(%{
           "error" => %{
@@ -123,6 +139,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "message" => "`linear_issue_handoff` expects an object with `issue_id` and `state_name`."
       }
     })
+  end
+
+  defp run_handoff_guard(_issue_id, state_name, opts) do
+    case Keyword.fetch(opts, :workspace) do
+      {:ok, workspace} ->
+        issue = Keyword.get(opts, :issue)
+        worker_host = Keyword.get(opts, :worker_host)
+
+        case Workspace.run_before_handoff_hook(workspace, issue, state_name, worker_host) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:handoff_guard_failed, reason}}
+        end
+
+      :error ->
+        :ok
+    end
   end
 
   defp execute_linear_graphql(arguments, opts) do

@@ -92,6 +92,27 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(failed["output"])["error"]["reason"] =~ "disk_full"
   end
 
+  test "linear_issue_handoff runs the gate before durable enqueue" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "linear_issue_handoff",
+        %{"issue_id" => "issue-1", "state_name" => "In Review"},
+        handoff_guard_fun: fn issue_id, state_name ->
+          send(test_pid, {:gate_ran, issue_id, state_name})
+          {:error, {:handoff_guard_failed, :evidence_incomplete}}
+        end,
+        handoff_fun: fn _issue_id, _state_name ->
+          flunk("handoff must not enqueue after a failed gate")
+        end
+      )
+
+    assert_received {:gate_ran, "issue-1", "In Review"}
+    assert response["success"] == false
+    assert Jason.decode!(response["output"])["error"]["reason"] =~ "evidence_incomplete"
+  end
+
   test "linear_graphql returns successful GraphQL responses as tool text" do
     test_pid = self()
 

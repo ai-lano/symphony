@@ -204,6 +204,44 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec run_before_handoff_hook(
+          Path.t(),
+          map() | String.t() | nil,
+          String.t(),
+          worker_host()
+        ) :: :ok | {:error, term()}
+  def run_before_handoff_hook(
+        workspace,
+        issue_or_identifier,
+        target_state,
+        worker_host \\ nil
+      )
+      when is_binary(workspace) and is_binary(target_state) do
+    issue_context = issue_context(issue_or_identifier)
+    hooks = Config.settings!().hooks
+
+    case hooks.before_handoff do
+      nil ->
+        :ok
+
+      command ->
+        environment = %{
+          "SYMPHONY_ISSUE_ID" => issue_context.issue_id || "",
+          "SYMPHONY_ISSUE_IDENTIFIER" => issue_context.issue_identifier,
+          "SYMPHONY_TARGET_STATE" => target_state
+        }
+
+        run_hook(
+          command,
+          workspace,
+          issue_context,
+          "before_handoff",
+          worker_host,
+          environment
+        )
+    end
+  end
+
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.settings!().workspace.root
     |> Path.join(safe_id)
@@ -302,14 +340,20 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
-  defp run_hook(command, workspace, issue_context, hook_name, nil) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host, environment \\ %{})
+
+  defp run_hook(command, workspace, issue_context, hook_name, nil, environment) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: Map.to_list(environment)
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -325,12 +369,21 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host, environment)
+       when is_binary(worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    exports =
+      environment
+      |> Enum.map_join("\n", fn {name, value} ->
+        "export #{name}=#{shell_escape(value)}"
+      end)
+
+    script = "cd #{shell_escape(workspace)} &&\n#{exports}\n#{command}"
+
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
