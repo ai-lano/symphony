@@ -64,7 +64,7 @@ defmodule SymphonyElixir.WorkspaceRegistry do
            :ok <- ensure_live_remote_upstream(entry),
            :ok <- ensure_registered(entry),
            :ok <- ensure_expected_branch(entry),
-           :ok <- run_git(entry.common_dir, ["worktree", "remove", workspace]),
+           :ok <- run_git(entry.common_dir, ["worktree", "remove", "--force", workspace]),
            :ok <- run_git(entry.common_dir, ["worktree", "prune"]),
            :ok <- remove(entry.issue_id) do
         {:ok, :removed}

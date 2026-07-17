@@ -31,6 +31,34 @@ defmodule SymphonyElixir.WorkspaceRegistryTest do
     assert :ok = WorkspaceRegistry.cleanup("issue-1")
   end
 
+  test "removes a clean registered linked worktree containing an initialized submodule", %{
+    worktree: worktree
+  } do
+    submodule = Path.join(Path.dirname(worktree), "submodule")
+    git!(Path.dirname(worktree), ["init", submodule])
+    git!(submodule, ["config", "user.email", "test@example.com"])
+    git!(submodule, ["config", "user.name", "Test"])
+    File.write!(Path.join(submodule, "README.md"), "submodule\n")
+    git!(submodule, ["add", "README.md"])
+    git!(submodule, ["commit", "-m", "initial"])
+
+    git!(worktree, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      submodule,
+      "runtime/dependency"
+    ])
+
+    git!(worktree, ["commit", "-am", "add submodule"])
+    git!(worktree, ["push"])
+
+    assert :ok = WorkspaceRegistry.register("issue-submodule", worktree)
+    assert :ok = WorkspaceRegistry.cleanup("issue-submodule")
+    refute File.exists?(worktree)
+  end
+
   test "preserves a dirty registered worktree", %{worktree: worktree} do
     assert :ok = WorkspaceRegistry.register("issue-2", worktree)
     File.write!(Path.join(worktree, "dirty.txt"), "keep\n")
