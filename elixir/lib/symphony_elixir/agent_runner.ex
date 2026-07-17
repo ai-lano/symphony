@@ -5,7 +5,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.Linear.{Issue, PendingHandoff}
 
   @type worker_host :: String.t() | nil
 
@@ -14,7 +15,18 @@ defmodule SymphonyElixir.AgentRunner do
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
       when is_function(issue_state_fetcher, 1) do
-    continue_with_issue?(issue, issue_state_fetcher)
+    continue_with_issue?(issue, issue_state_fetcher, fn _issue_id -> false end)
+  end
+
+  @doc false
+  @spec continue_with_issue_for_test(
+          Issue.t(),
+          ([String.t()] -> term()),
+          (String.t() -> boolean())
+        ) :: {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
+  def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher, pending_handoff_fun)
+      when is_function(issue_state_fetcher, 1) and is_function(pending_handoff_fun, 1) do
+    continue_with_issue?(issue, issue_state_fetcher, pending_handoff_fun)
   end
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
@@ -110,7 +122,10 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
+      pending_handoff_fun =
+        Keyword.get(opts, :pending_handoff_fun, &PendingHandoff.pending?/1)
+
+      case continue_with_issue?(issue, issue_state_fetcher, pending_handoff_fun) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
@@ -153,7 +168,20 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher, pending_handoff_fun)
+       when is_binary(issue_id) do
+    if pending_handoff_fun.(issue_id) do
+      Logger.info("Stopping agent continuation for #{issue_context(issue)} because a durable handoff is pending")
+      {:done, issue}
+    else
+      refresh_issue_for_continuation(issue, issue_state_fetcher)
+    end
+  end
+
+  defp continue_with_issue?(issue, _issue_state_fetcher, _pending_handoff_fun),
+    do: {:done, issue}
+
+  defp refresh_issue_for_continuation(%Issue{id: issue_id} = issue, issue_state_fetcher) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
@@ -169,8 +197,6 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, {:issue_state_refresh_failed, reason}}
     end
   end
-
-  defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
