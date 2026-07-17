@@ -7,7 +7,16 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Codex.ThreadRegistry, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Codex.ThreadRegistry,
+    Config,
+    StatusDashboard,
+    TerminalReconciler,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.Linear.{PendingHandoff, RateLimiter}
 
@@ -254,6 +263,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
+    :ok = TerminalReconciler.reconcile(state)
+
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
@@ -373,6 +384,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec reconcile_terminal_resources_for_test(map(), keyword()) :: :ok
+  def reconcile_terminal_resources_for_test(state, opts \\ []) when is_map(state) do
+    TerminalReconciler.reconcile(state, opts)
   end
 
   @doc false

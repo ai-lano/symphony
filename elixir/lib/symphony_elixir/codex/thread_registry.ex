@@ -68,6 +68,30 @@ defmodule SymphonyElixir.Codex.ThreadRegistry do
     end
   end
 
+  @spec entries() :: {:ok, [%{issue_id: String.t()} | entry()]} | {:error, term()}
+  def entries do
+    directory = Path.dirname(path_for("registry-probe"))
+
+    case File.ls(directory) do
+      {:ok, names} -> read_entries(directory, names)
+      {:error, :enoent} -> {:ok, []}
+      {:error, reason} -> {:error, {:registry_read_failed, reason}}
+    end
+  end
+
+  @spec archive(String.t(), String.t(), DateTime.t()) :: :ok | {:error, term()}
+  def archive(issue_id, reason, archived_at \\ DateTime.utc_now())
+      when is_binary(issue_id) and is_binary(reason) do
+    with {:ok, entry} <- fetch_entry(issue_id),
+         :ok <- write_audit(issue_id, entry, reason, archived_at),
+         :ok <- File.rm(path_for(issue_id)) do
+      :ok
+    else
+      :missing -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @doc false
   @spec path_for(String.t()) :: Path.t()
   def path_for(issue_id) when is_binary(issue_id) do
@@ -96,6 +120,59 @@ defmodule SymphonyElixir.Codex.ThreadRegistry do
         {:error, :invalid_registry_entry}
     end
   end
+
+  defp decode_any(raw) do
+    case Jason.decode(raw) do
+      {:ok, %{"version" => 1, "issue_id" => issue_id, "thread_id" => thread_id, "worker_host" => worker_host}}
+      when is_binary(issue_id) and is_binary(thread_id) and byte_size(thread_id) > 0 and
+             (is_binary(worker_host) or is_nil(worker_host)) ->
+        {:ok, %{issue_id: issue_id, thread_id: thread_id, worker_host: worker_host}}
+
+      _ ->
+        {:error, :invalid_payload}
+    end
+  end
+
+  defp read_entries(directory, names) do
+    names
+    |> Enum.filter(&String.ends_with?(&1, ".json"))
+    |> Enum.reduce_while({:ok, []}, &read_entry(directory, &1, &2))
+    |> then(fn
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      error -> error
+    end)
+  end
+
+  defp read_entry(directory, name, {:ok, entries}) do
+    with {:ok, raw} <- File.read(Path.join(directory, name)),
+         {:ok, entry} <- decode_any(raw) do
+      {:cont, {:ok, [entry | entries]}}
+    else
+      {:error, :invalid_payload} -> {:halt, {:error, {:invalid_registry_entry, name}}}
+      {:error, reason} -> {:halt, {:error, {:registry_read_failed, reason}}}
+    end
+  end
+
+  defp write_audit(issue_id, %{thread_id: thread_id}, reason, archived_at) do
+    path = Path.join([state_root(), "codex_threads", workflow_key(), "archived", audit_key(issue_id) <> ".json"])
+
+    payload =
+      Jason.encode!(%{
+        "issue_id" => issue_id,
+        "role" => Path.basename(Workflow.workflow_file_path()),
+        "thread_id" => thread_id,
+        "archived_at" => DateTime.to_iso8601(archived_at),
+        "reason" => reason
+      })
+
+    with :ok <- File.mkdir_p(Path.dirname(path)), :ok <- File.write(path, payload) do
+      :ok
+    else
+      {:error, reason} -> {:error, {:registry_write_failed, reason}}
+    end
+  end
+
+  defp audit_key(issue_id), do: issue_id |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
 
   defp workflow_key do
     Workflow.workflow_file_path()

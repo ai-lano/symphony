@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @thread_resume_id 4
+  @thread_archive_id 5
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
@@ -156,6 +157,28 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
+  end
+
+  @doc """
+  Archives a persisted Codex thread without opening a turn.
+
+  Archiving deliberately uses a short-lived app-server connection so terminal
+  reconciliation never needs to retain an agent session just to close a thread.
+  """
+  @spec archive_thread(String.t(), String.t() | nil) :: :ok | {:error, term()}
+  def archive_thread(thread_id, worker_host \\ nil) when is_binary(thread_id) do
+    workspace = Config.settings!().workspace.root
+
+    with {:ok, port} <- start_port(workspace, worker_host) do
+      try do
+        case send_initialize(port) do
+          :ok -> send_thread_archive(port, thread_id)
+          error -> error
+        end
+      after
+        stop_port(port)
+      end
+    end
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -450,6 +473,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @thread_resume_id) do
       {:ok, %{"thread" => %{"id" => resumed_thread_id}}} -> {:ok, resumed_thread_id}
       {:ok, thread_payload} -> {:error, {:invalid_thread_payload, thread_payload}}
+      other -> other
+    end
+  end
+
+  defp send_thread_archive(port, thread_id) do
+    send_message(port, %{
+      "method" => "thread/archive",
+      "id" => @thread_archive_id,
+      "params" => %{"threadId" => thread_id}
+    })
+
+    case await_response(port, @thread_archive_id) do
+      {:ok, _result} -> :ok
       other -> other
     end
   end
