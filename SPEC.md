@@ -631,7 +631,10 @@ Important nuance:
 
 - A successful worker exit does not mean the issue is done forever.
 - The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
-- After each normal turn completion, the worker re-checks the tracker issue state.
+- After each normal turn completion, the worker first checks whether a durable issue handoff is
+  pending. If so, it MUST exit the current turn loop without refreshing the tracker or starting
+  another coding-agent turn.
+- Without a pending handoff, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
 - The first turn SHOULD use the full rendered task prompt.

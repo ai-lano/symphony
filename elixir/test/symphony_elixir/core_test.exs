@@ -638,6 +638,48 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
+  test "agent runner stops before refreshing state when a durable handoff is pending" do
+    issue = %Issue{
+      id: "issue-pending-handoff",
+      identifier: "MT-566",
+      title: "Handoff already queued",
+      state: "In Progress",
+      labels: ["symphony"]
+    }
+
+    fetcher = fn _ids -> flunk("state must not be fetched after a durable handoff") end
+    pending_handoff_fun = fn "issue-pending-handoff" -> true end
+
+    assert {:done, ^issue} =
+             AgentRunner.continue_with_issue_for_test(
+               issue,
+               fetcher,
+               pending_handoff_fun
+             )
+  end
+
+  test "agent runner preserves active-state continuation without a pending handoff" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
+
+    issue = %Issue{
+      id: "issue-no-pending-handoff",
+      identifier: "MT-567",
+      title: "Continue active work",
+      state: "In Progress",
+      labels: ["symphony"]
+    }
+
+    fetcher = fn ["issue-no-pending-handoff"] -> {:ok, [issue]} end
+    pending_handoff_fun = fn "issue-no-pending-handoff" -> false end
+
+    assert {:continue, ^issue} =
+             AgentRunner.continue_with_issue_for_test(
+               issue,
+               fetcher,
+               pending_handoff_fun
+             )
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
