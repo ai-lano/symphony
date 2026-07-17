@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Linear.{PendingHandoff, RateLimiter}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -33,6 +34,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :linear_rate_limit,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -61,6 +63,7 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      linear_rate_limit: nil,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
@@ -110,7 +113,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
+    state = schedule_tick(state, next_poll_delay(state))
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
@@ -254,7 +257,7 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      choose_issues(issues, %{state | linear_rate_limit: nil})
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -290,12 +293,20 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
         state
 
+      {:error, {:linear_rate_limited, details}} ->
+        Logger.warning(
+          "Linear polling paused by rate limit retry_after_ms=#{details.retry_after_ms} " <>
+            "retry_at_unix_ms=#{details.retry_at_unix_ms} source=#{details.source}"
+        )
+
+        %{state | linear_rate_limit: details}
+
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
         state
 
       false ->
-        state
+        %{state | linear_rate_limit: nil}
     end
   end
 
@@ -812,6 +823,7 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
+      !PendingHandoff.pending?(issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -1080,22 +1092,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues() do
-      {:ok, issues} ->
-        issues
-        |> find_issue_by_id(issue_id)
-        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+    if PendingHandoff.pending?(issue_id) do
+      Logger.info(
+        "Issue has a durable Linear handoff pending; suppressing continuation poll and agent redispatch " <>
+          "issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}"
+      )
 
-      {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+      {:noreply, release_issue_claim(state, issue_id)}
+    else
+      case Tracker.fetch_candidate_issues() do
+        {:ok, issues} ->
+          issues
+          |> find_issue_by_id(issue_id)
+          |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
 
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-         )}
+        {:error, reason} ->
+          Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+          {:noreply,
+           schedule_issue_retry(
+             state,
+             issue_id,
+             attempt + 1,
+             Map.merge(metadata, %{
+               error: "retry poll failed: #{inspect(reason)}",
+               delay_ms: RateLimiter.retry_after_ms(reason)
+             })
+           )}
+      end
     end
   end
 
@@ -1103,6 +1127,14 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     cond do
+      PendingHandoff.pending?(issue_id) ->
+        Logger.info(
+          "Issue has a durable Linear handoff pending; suppressing agent redispatch " <>
+            "issue_id=#{issue_id} issue_identifier=#{issue.identifier}"
+        )
+
+        {:noreply, release_issue_claim(state, issue_id)}
+
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
@@ -1190,10 +1222,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    case metadata[:delay_ms] do
+      delay_ms when is_integer(delay_ms) and delay_ms > 0 ->
+        delay_ms
+
+      _ ->
+        if metadata[:delay_type] == :continuation and attempt == 1 do
+          @continuation_retry_delay_ms
+        else
+          failure_retry_delay(attempt)
+        end
     end
   end
 
@@ -1434,8 +1472,10 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       pending_handoffs: PendingHandoff.snapshot(),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       linear_rate_limit: Map.get(state, :linear_rate_limit),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1564,6 +1604,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp next_poll_in_ms(next_poll_due_at_ms, now_ms) when is_integer(next_poll_due_at_ms) do
     max(0, next_poll_due_at_ms - now_ms)
+  end
+
+  defp next_poll_delay(%State{linear_rate_limit: details, poll_interval_ms: interval_ms}) do
+    case RateLimiter.retry_after_ms({:linear_rate_limited, details}) do
+      retry_after_ms when is_integer(retry_after_ms) -> max(interval_ms, retry_after_ms)
+      _ -> interval_ms
+    end
   end
 
   defp pop_running_entry(state, issue_id) do

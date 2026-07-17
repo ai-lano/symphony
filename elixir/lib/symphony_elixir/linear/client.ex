@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.Linear.RateLimiter
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -166,22 +167,50 @@ defmodule SymphonyElixir.Linear.Client do
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
     request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
 
-    with {:ok, headers} <- graphql_headers(),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
-      {:ok, body}
+    with :ok <- RateLimiter.before_request(),
+         {:ok, headers} <- graphql_headers(),
+         {:ok, response} <- request_fun.(payload, headers) do
+      handle_graphql_response(payload, response)
     else
-      {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
+      {:error, {:linear_rate_limited, details}} = error ->
+        Logger.warning(
+          "Linear GraphQL request suppressed by shared rate-limit gate " <>
+            "retry_after_ms=#{details.retry_after_ms} retry_at_unix_ms=#{details.retry_at_unix_ms}"
         )
 
-        {:error, {:linear_api_status, response.status}}
+        error
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
         {:error, {:linear_api_request, reason}}
     end
+  end
+
+  defp handle_graphql_response(payload, response) do
+    case RateLimiter.observe_response(response) do
+      :ok ->
+        handle_graphql_status(payload, response)
+
+      {:error, {:linear_rate_limited, details}} = error ->
+        Logger.warning(
+          "Linear GraphQL rate limited retry_after_ms=#{details.retry_after_ms} " <>
+            "retry_at_unix_ms=#{details.retry_at_unix_ms} source=#{details.source}" <>
+            linear_error_context(payload, response)
+        )
+
+        error
+    end
+  end
+
+  defp handle_graphql_status(_payload, %{status: 200, body: body}), do: {:ok, body}
+
+  defp handle_graphql_status(payload, response) do
+    Logger.error(
+      "Linear GraphQL request failed status=#{response.status}" <>
+        linear_error_context(payload, response)
+    )
+
+    {:error, {:linear_api_status, response.status}}
   end
 
   @doc false
