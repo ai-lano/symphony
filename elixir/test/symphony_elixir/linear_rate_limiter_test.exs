@@ -33,7 +33,7 @@ defmodule SymphonyElixir.Linear.RateLimiterTest do
              RateLimiter.before_request(path: path, now_ms: 61_000)
 
     assert :ok = RateLimiter.before_request(path: path, now_ms: 63_000)
-    refute File.exists?(path)
+    assert File.exists?(path)
   end
 
   test "uses response duration when reset headers are missing", %{path: path} do
@@ -58,18 +58,32 @@ defmodule SymphonyElixir.Linear.RateLimiterTest do
     assert details.source == "response_duration"
   end
 
-  test "falls back to jittered exponential backoff for plain HTTP 429", %{path: path} do
+  test "preserves jittered fallback backoff across repeated plain HTTP 429s", %{path: path} do
     response = %{status: 429, body: "too many requests"}
+    jitter = fn _range -> 1 end
 
     assert {:error, {:linear_rate_limited, details}} =
              RateLimiter.observe_response(response,
                path: path,
                now_ms: 10_000,
-               jitter_fun: fn _range -> 1 end
+               jitter_fun: jitter
              )
 
     assert details.retry_after_ms == 24_000
     assert details.source == "exponential_backoff"
+    assert details.attempt == 1
+    assert :ok = RateLimiter.before_request(path: path, now_ms: 34_000)
+
+    assert {:error, {:linear_rate_limited, second}} =
+             RateLimiter.observe_response(response,
+               path: path,
+               now_ms: 34_000,
+               jitter_fun: jitter
+             )
+
+    assert second.attempt == 2
+    assert second.retry_after_ms == 48_000
+    assert second.retry_at_unix_ms == 82_000
   end
 
   test "a successful response clears an expired persisted gate", %{path: path} do

@@ -31,7 +31,6 @@ defmodule SymphonyElixir.Linear.RateLimiter do
         {:error, {:linear_rate_limited, details_from_state(state, now_ms)}}
 
       %{} ->
-        remove_state(path)
         :ok
 
       nil ->
