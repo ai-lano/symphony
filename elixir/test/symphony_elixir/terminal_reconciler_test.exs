@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.TerminalReconcilerTest do
   use SymphonyElixir.TestSupport
 
+  import ExUnit.CaptureLog
+
   alias SymphonyElixir.Orchestrator
 
   defmodule RegistryStub do
@@ -70,6 +72,37 @@ defmodule SymphonyElixir.TerminalReconcilerTest do
     assert :ok = reconcile(%Orchestrator.State{})
     assert_received {:workspace_cleanup, "terminal"}
     refute_received {:archive_call, _, _}
+  end
+
+  test "logs a preserved registered worktree when an active run blocks cleanup" do
+    Application.put_env(:symphony_elixir, :terminal_entries, {:ok, []})
+    Application.put_env(:symphony_elixir, :terminal_workspaces, {:ok, [%{issue_id: "terminal"}]})
+
+    log = capture_log(fn -> assert :ok = reconcile(%Orchestrator.State{running: %{"terminal" => %{}}}) end)
+
+    assert log =~ "issue_id=terminal"
+    assert log =~ "issue_identifier=T-1"
+    assert log =~ "resource=worktree"
+    assert log =~ "action=remove"
+    assert log =~ "result=preserved"
+    assert log =~ "reason=active_run"
+  end
+
+  test "logs typed registered worktree cleanup outcomes" do
+    Application.put_env(:symphony_elixir, :terminal_entries, {:ok, []})
+    Application.put_env(:symphony_elixir, :terminal_workspaces, {:ok, [%{issue_id: "terminal"}]})
+
+    log =
+      capture_log(fn ->
+        assert :ok = reconcile(%Orchestrator.State{}, workspace_cleanup_fun: fn _ -> {:ok, :already_removed} end)
+      end)
+
+    assert log =~ "issue_id=terminal"
+    assert log =~ "issue_identifier=T-1"
+    assert log =~ "resource=worktree"
+    assert log =~ "action=remove"
+    assert log =~ "result=noop"
+    assert log =~ "reason=already_removed"
   end
 
   defp reconcile(state, overrides \\ []) do

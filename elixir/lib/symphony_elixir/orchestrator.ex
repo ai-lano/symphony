@@ -43,6 +43,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       :linear_rate_limit,
+      :now_fun,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -60,8 +61,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
-    now_ms = System.monotonic_time(:millisecond)
+  def init(opts) do
+    now_fun = Keyword.get(opts, :now_fun, fn -> System.monotonic_time(:millisecond) end)
+    now_ms = now_fun.()
     config = Config.settings!()
 
     state = %State{
@@ -72,6 +74,7 @@ defmodule SymphonyElixir.Orchestrator do
       tick_timer_ref: nil,
       tick_token: nil,
       linear_rate_limit: nil,
+      now_fun: now_fun,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
@@ -1057,7 +1060,7 @@ defmodule SymphonyElixir.Orchestrator do
     delay_ms = retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+    due_at_ms = now_ms(state) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     issue_url = pick_retry_issue_url(previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
@@ -1642,6 +1645,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp next_poll_in_ms(next_poll_due_at_ms, now_ms) when is_integer(next_poll_due_at_ms) do
     max(0, next_poll_due_at_ms - now_ms)
   end
+
+  defp now_ms(%State{now_fun: now_fun}) when is_function(now_fun, 0), do: now_fun.()
+  defp now_ms(_state), do: System.monotonic_time(:millisecond)
 
   defp next_poll_delay(%State{linear_rate_limit: details, poll_interval_ms: interval_ms}) do
     case RateLimiter.retry_after_ms({:linear_rate_limited, details}) do

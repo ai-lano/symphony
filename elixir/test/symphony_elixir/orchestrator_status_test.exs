@@ -910,7 +910,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     issue_id = "issue-stall"
     orchestrator_name = Module.concat(__MODULE__, :StallOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, now_fun: fn -> 1_000 end)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -966,10 +966,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              error: "stalled for " <> _
            } = state.retry_attempts[issue_id]
 
-    assert is_integer(due_at_ms)
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
-    assert remaining_ms <= 10_500
+    assert due_at_ms == 11_000
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
@@ -980,7 +977,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     issue_id = "issue-mcp-elicitation-stall"
     orchestrator_name = Module.concat(__MODULE__, :McpElicitationBlockOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, now_fun: fn -> 1_000 end)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1029,7 +1026,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     send(pid, :tick)
     Process.sleep(100)
-    state = :sys.get_state(pid)
+    state = :sys.get_state(pid, 5_000)
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
