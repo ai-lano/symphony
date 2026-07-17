@@ -39,6 +39,17 @@ defmodule SymphonyElixir.WorkspaceRegistry do
     end
   end
 
+  @spec entries() :: {:ok, [entry()]} | {:error, term()}
+  def entries do
+    directory = Path.dirname(path_for("registry-probe"))
+
+    case File.ls(directory) do
+      {:ok, names} -> read_entries(directory, names)
+      {:error, :enoent} -> {:ok, []}
+      {:error, reason} -> {:error, {:registry_read_failed, reason}}
+    end
+  end
+
   defp cleanup_local(%{workspace: workspace} = entry) do
     if File.exists?(workspace) do
       with :ok <- ensure_clean(entry),
@@ -111,8 +122,14 @@ defmodule SymphonyElixir.WorkspaceRegistry do
   defp clean_status?(status) do
     lines = String.split(status, "\n", trim: true)
 
-    Enum.all?(lines, &(String.starts_with?(&1, "# branch.") or String.starts_with?(&1, "## "))) and
-      !String.contains?(status, "ahead ")
+    case lines do
+      [branch_line] ->
+        String.starts_with?(branch_line, "## ") and String.contains?(branch_line, "...") and
+          !String.contains?(branch_line, ["ahead ", "behind "])
+
+      _ ->
+        false
+    end
   end
 
   defp listed_and_unlocked?(output, workspace) do
@@ -167,6 +184,50 @@ defmodule SymphonyElixir.WorkspaceRegistry do
        }}
       when is_binary(workspace) and is_binary(common_dir) and is_binary(branch) and
              (is_binary(worker_host) or is_nil(worker_host)) ->
+        {:ok,
+         %{
+           issue_id: issue_id,
+           workspace: workspace,
+           common_dir: common_dir,
+           branch: branch,
+           worker_host: worker_host
+         }}
+
+      _ ->
+        {:error, :invalid_registry_entry}
+    end
+  end
+
+  defp read_entries(directory, names) do
+    names
+    |> Enum.filter(&String.ends_with?(&1, ".json"))
+    |> Enum.reduce_while({:ok, []}, fn name, {:ok, entries} ->
+      with {:ok, raw} <- File.read(Path.join(directory, name)),
+           {:ok, entry} <- decode_any(raw) do
+        {:cont, {:ok, [entry | entries]}}
+      else
+        {:error, reason} -> {:halt, {:error, {:registry_read_failed, name, reason}}}
+      end
+    end)
+    |> then(fn
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      error -> error
+    end)
+  end
+
+  defp decode_any(raw) do
+    case Jason.decode(raw) do
+      {:ok,
+       %{
+         "version" => 1,
+         "issue_id" => issue_id,
+         "workspace" => workspace,
+         "common_dir" => common_dir,
+         "branch" => branch,
+         "worker_host" => worker_host
+       }}
+      when is_binary(issue_id) and is_binary(workspace) and is_binary(common_dir) and
+             is_binary(branch) and (is_binary(worker_host) or is_nil(worker_host)) ->
         {:ok,
          %{
            issue_id: issue_id,

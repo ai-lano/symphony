@@ -15,13 +15,19 @@ defmodule SymphonyElixir.TerminalReconcilerTest do
     end
   end
 
+  defmodule WorkspaceRegistryStub do
+    def entries, do: Application.fetch_env!(:symphony_elixir, :terminal_workspaces)
+  end
+
   setup do
     Application.put_env(:symphony_elixir, :terminal_entries, {:ok, [%{issue_id: "terminal", thread_id: "thread-1", worker_host: nil}]})
     Application.put_env(:symphony_elixir, :terminal_issues, [%{id: "terminal", identifier: "T-1", state: "Done"}])
+    Application.put_env(:symphony_elixir, :terminal_workspaces, {:ok, []})
 
     on_exit(fn ->
       Application.delete_env(:symphony_elixir, :terminal_entries)
       Application.delete_env(:symphony_elixir, :terminal_issues)
+      Application.delete_env(:symphony_elixir, :terminal_workspaces)
     end)
   end
 
@@ -57,12 +63,22 @@ defmodule SymphonyElixir.TerminalReconcilerTest do
     assert_received {:archived, "terminal", "terminal:Done"}
   end
 
+  test "retries a registered worktree after its thread mapping has archived" do
+    Application.put_env(:symphony_elixir, :terminal_entries, {:ok, []})
+    Application.put_env(:symphony_elixir, :terminal_workspaces, {:ok, [%{issue_id: "terminal"}]})
+
+    assert :ok = reconcile(%Orchestrator.State{})
+    assert_received {:workspace_cleanup, "terminal"}
+    refute_received {:archive_call, _, _}
+  end
+
   defp reconcile(state, overrides \\ []) do
     Orchestrator.reconcile_terminal_resources_for_test(
       state,
       Keyword.merge(
         [
           registry: RegistryStub,
+          workspace_registry: WorkspaceRegistryStub,
           tracker: TrackerStub,
           terminal_states: ["Done"],
           pending_fun: fn _ -> false end,

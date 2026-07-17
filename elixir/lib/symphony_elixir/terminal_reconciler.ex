@@ -2,8 +2,9 @@ defmodule SymphonyElixir.TerminalReconciler do
   @moduledoc """
   Reconciles terminal issues owned by the current workflow lane.
 
-  The persisted thread registry is the source of candidates. This intentionally
-  does not depend on the dispatch query, which normally excludes terminal work.
+  Persisted thread and worktree registries are the candidate sources. This
+  intentionally does not depend on the dispatch query, which excludes terminal
+  work and would otherwise strand preserved worktrees after thread archival.
   """
 
   require Logger
@@ -17,26 +18,34 @@ defmodule SymphonyElixir.TerminalReconciler do
   @spec reconcile(map(), keyword()) :: :ok
   def reconcile(state, opts \\ []) when is_map(state) do
     registry = Keyword.get(opts, :registry, ThreadRegistry)
+    workspace_registry = Keyword.get(opts, :workspace_registry, WorkspaceRegistry)
     tracker = Keyword.get(opts, :tracker, Tracker)
     archive_fun = Keyword.get(opts, :archive_fun, &AppServer.archive_thread/2)
     workspace_cleanup_fun = Keyword.get(opts, :workspace_cleanup_fun, &WorkspaceRegistry.cleanup/1)
     pending_fun = Keyword.get(opts, :pending_fun, &PendingHandoff.pending?/1)
     terminal_states = terminal_state_set(Keyword.get(opts, :terminal_states))
 
-    with {:ok, entries} <- registry.entries(),
-         {:ok, issues} <- fetch_in_batches(entries, tracker) do
+    with {:ok, thread_entries} <- registry.entries(),
+         {:ok, workspace_entries} <- workspace_registry.entries(),
+         {:ok, issues} <- fetch_in_batches(thread_entries ++ workspace_entries, tracker) do
       issues_by_id = Map.new(issues, &{&1.id, &1})
 
-      Enum.each(entries, fn entry ->
-        reconcile_entry(
-          entry,
-          issues_by_id,
+      (thread_entries ++ workspace_entries)
+      |> Enum.map(& &1.issue_id)
+      |> Enum.uniq()
+      |> Enum.each(fn issue_id ->
+        reconcile_issue(
+          issue_id,
+          Map.get(issues_by_id, issue_id),
+          Enum.find(thread_entries, &(&1.issue_id == issue_id)),
           state,
-          terminal_states,
-          archive_fun,
-          workspace_cleanup_fun,
-          pending_fun,
-          registry
+          %{
+            terminal_states: terminal_states,
+            archive_fun: archive_fun,
+            workspace_cleanup_fun: workspace_cleanup_fun,
+            pending_fun: pending_fun,
+            registry: registry
+          }
         )
       end)
     else
@@ -60,24 +69,32 @@ defmodule SymphonyElixir.TerminalReconciler do
     end)
   end
 
-  defp reconcile_entry(entry, issues, state, terminal_states, archive_fun, workspace_cleanup_fun, pending_fun, registry) do
-    case Map.get(issues, entry.issue_id) do
+  defp reconcile_issue(issue_id, issue, thread_entry, state, context) do
+    case issue do
       %{state: issue_state} = issue when is_binary(issue_state) ->
         cond do
-          !MapSet.member?(terminal_states, normalize(issue_state)) -> :ok
-          active?(state, entry.issue_id) -> log_skip(issue, entry, "active_run")
-          pending_fun.(entry.issue_id) -> log_skip(issue, entry, "pending_handoff")
-          true -> archive(entry, issue, archive_fun, workspace_cleanup_fun, registry)
+          !MapSet.member?(context.terminal_states, normalize(issue_state)) ->
+            :ok
+
+          active?(state, issue_id) ->
+            log_skip(issue, issue_id, "active_run")
+
+          context.pending_fun.(issue_id) ->
+            log_skip(issue, issue_id, "pending_handoff")
+
+          true ->
+            _ = context.workspace_cleanup_fun.(issue_id)
+            archive(thread_entry, issue, context.archive_fun, context.registry)
         end
 
       _ ->
-        Logger.warning("Terminal resource reconciliation skipped issue_id=#{entry.issue_id} lane=#{lane()} resource=thread action=archive result=preserved reason=missing_issue_metadata")
+        Logger.warning("Terminal resource reconciliation skipped issue_id=#{issue_id} lane=#{lane()} resource=thread action=archive result=preserved reason=missing_issue_metadata")
     end
   end
 
-  defp archive(entry, issue, archive_fun, workspace_cleanup_fun, registry) do
-    _ = workspace_cleanup_fun.(entry.issue_id)
+  defp archive(nil, _issue, _archive_fun, _registry), do: :ok
 
+  defp archive(entry, issue, archive_fun, registry) do
     case archive_fun.(entry.thread_id, entry.worker_host) do
       :ok ->
         case registry.archive(entry.issue_id, "terminal:#{issue.state}") do
@@ -96,8 +113,8 @@ defmodule SymphonyElixir.TerminalReconciler do
       MapSet.member?(Map.get(state, :claimed, MapSet.new()), issue_id)
   end
 
-  defp log_skip(issue, entry, reason) do
-    Logger.info("Terminal resource reconciliation issue_id=#{entry.issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=preserved reason=#{reason}")
+  defp log_skip(issue, issue_id, reason) do
+    Logger.info("Terminal resource reconciliation issue_id=#{issue_id} issue_identifier=#{issue.identifier} lane=#{lane()} resource=thread action=archive result=preserved reason=#{reason}")
   end
 
   defp terminal_state_set(nil), do: terminal_state_set(Config.settings!().tracker.terminal_states)

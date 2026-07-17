@@ -13,8 +13,7 @@ defmodule SymphonyElixir.Orchestrator do
     Config,
     StatusDashboard,
     TerminalReconciler,
-    Tracker,
-    Workspace
+    Tracker
   }
 
   alias SymphonyElixir.Linear.Issue
@@ -1186,7 +1185,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
 
   defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+    Logger.warning(
+      "Skipping legacy terminal workspace cleanup issue_identifier=#{identifier} " <>
+        "worker_host=#{inspect(worker_host)}; registered-worktree reconciliation owns cleanup"
+    )
+
+    :ok
   end
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok

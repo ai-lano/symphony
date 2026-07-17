@@ -6,6 +6,7 @@ defmodule SymphonyElixir.WorkspaceRegistryTest do
   setup do
     root = Path.join(System.tmp_dir!(), "symphony-worktree-registry-#{System.unique_integer([:positive])}")
     repo = Path.join(root, "repo")
+    remote = Path.join(root, "remote.git")
     worktree = Path.join(root, "issue")
     File.mkdir_p!(root)
     git!(root, ["init", repo])
@@ -15,6 +16,9 @@ defmodule SymphonyElixir.WorkspaceRegistryTest do
     git!(repo, ["add", "README.md"])
     git!(repo, ["commit", "-m", "initial"])
     git!(repo, ["worktree", "add", "-b", "issue-branch", worktree])
+    git!(root, ["init", "--bare", remote])
+    git!(repo, ["remote", "add", "origin", remote])
+    git!(worktree, ["push", "-u", "origin", "issue-branch"])
 
     on_exit(fn -> File.rm_rf(root) end)
     %{repo: repo, worktree: worktree}
@@ -31,6 +35,13 @@ defmodule SymphonyElixir.WorkspaceRegistryTest do
     assert :ok = WorkspaceRegistry.register("issue-2", worktree)
     File.write!(Path.join(worktree, "dirty.txt"), "keep\n")
     assert {:error, :dirty_or_unpushed} = WorkspaceRegistry.cleanup("issue-2")
+    assert File.exists?(worktree)
+  end
+
+  test "preserves a branch with no upstream or unpushed commits", %{worktree: worktree} do
+    git!(worktree, ["branch", "--unset-upstream"])
+    assert :ok = WorkspaceRegistry.register("issue-3", worktree)
+    assert {:error, :dirty_or_unpushed} = WorkspaceRegistry.cleanup("issue-3")
     assert File.exists?(worktree)
   end
 
